@@ -1,5 +1,4 @@
 import numpy as np
-import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -44,7 +43,7 @@ class ReinforcePolicy:
         Sample an action from the current policy and store its log-prob.
         state: np.ndarray of shape (state_size,)
         """
-        
+        self.policy.train()  # Ensure the policy is in training mode for dropout/batchnorm if used
         # Ensure state is a 1D vector of floats and convret to tensor
         state_vec = self._flatten_state(state) 
         state_tensor = torch.as_tensor(
@@ -53,8 +52,7 @@ class ReinforcePolicy:
             dtype=torch.float32,
         )
 
-        # Forward pass with gradients enabled for proper backprop
-        self.policy.eval()
+        # Forward pass - use no_grad context for inference without affecting training mode
         logits = self.policy(state_tensor)
         dist = torch.distributions.Categorical(logits=logits)
 
@@ -64,28 +62,16 @@ class ReinforcePolicy:
         # Computes log-prob and entropy for this action
         log_prob = dist.log_prob(action)  
         entropy = dist.entropy()
+
+        return int(action.item()), log_prob.squeeze(0), entropy.squeeze(0)
+
+    #*********************************************************************************#
+    def remember(self, reward, log_prob, entropy):
+        """Store reward for this time step."""
+        # Convert reward to float to maintain consistency
+        self.rewards.append(float(reward))
         self.log_probs.append(log_prob)
         self.entropies.append(entropy)
-
-        return int(action.item())
-
-    #*********************************************************************************#
-    def remember_reward(self, reward):
-        """Store reward for this time step."""
-        self.rewards.append(float(reward))
-
-    #*********************************************************************************#
-    def _compute_returns(self):
-        """Compute discounted returns G_t Monte Carlo style from rewards collected in this episode."""
-        returns = []
-        G = 0.0
-        for r in reversed(self.rewards):
-            G = r + self.gamma * G
-            returns.append(G)
-        returns.reverse() # Calculate G from back to front, then reverse to match time steps
-        returns = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
-
-        return returns
 
     #*********************************************************************************#
     def learn(self):
@@ -95,32 +81,38 @@ class ReinforcePolicy:
         """
         if not self.log_probs or not self.rewards:
             self.last_entropy_mean = 0.0
-            return False, 0.0
+            return False, 0.0, 0.0
+
+        self.policy.train()
 
         # Computes G(t) for each time step in the episode
-        returns = self._compute_returns()
+        returns = []
+        G = 0.0
+        for r in reversed(self.rewards):
+            G = r + self.gamma * G
+            returns.append(G)
+        returns.reverse()  # Calculate G from back to front, then reverse to match time steps
+        returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
 
         # Advantage: Normalizes returns for better training stability used in baseline REINFORCE preventing 
         # large reward swings from destabilizing learning.
-        advantages = returns - returns.mean()
-        advantages = advantages / (advantages.std(unbiased=False) + 1e-8)
-
-        self.policy.train()
+        advantages = (returns - returns.mean()) / (returns.std() + 1e-8)
 
         # Entropy Bonus: Encourages exploration by adding a term to the loss that rewards higher entropy 
         # (more randomness) in the action distribution helping prevent premature convergence.
         log_probs_tensor = torch.stack(self.log_probs)
         entropy_tensor = torch.stack(self.entropies)
         self.last_entropy_mean = float(entropy_tensor.mean().detach().item())
-        policy_loss = -(log_probs_tensor * advantages).sum()
-        entropy_bonus = entropy_tensor.sum()
+        
+        # Normalize by episode length to keep loss scale consistent across variable episode lengths
+        policy_loss = -(log_probs_tensor * advantages.detach()).mean()
+        
+        entropy_bonus = entropy_tensor.mean()
         loss = policy_loss - self.entropy_coef * entropy_bonus
 
         self.optimizer.zero_grad()
         loss.backward()
         
-        # Gradient clipping: Prevents exploding gradients by scaling down large gradients 
-        # to a maximum norm improving training stability. especially in reinforcement learning where reward signals can be noisy and lead to large updates.
         torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
         
         self.optimizer.step()
@@ -130,7 +122,7 @@ class ReinforcePolicy:
         self.entropies.clear()
         self.rewards.clear()
 
-        return True, float(loss.item())
+        return True, float(loss.item()), float(entropy_bonus.item())
 
     #*********************************************************************************#
     def save(self, path):

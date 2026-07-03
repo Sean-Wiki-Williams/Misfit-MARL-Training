@@ -1,15 +1,42 @@
-import csv
 import os
 import time
 from datetime import datetime
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+import pygame
 from pettingzoo.butterfly import knights_archers_zombies_v10
 from DQN import DQN_Logic
-from PG import ReinforcePolicy
+from REINFORCE import ReinforcePolicy
 from A2C import A2C_Logic
 from PPO import PPOPolicy
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+import subprocess
+import os
+import webbrowser
+import random
+import logging
+from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
+#***************************************************************************************************************#
+def launch_tensorboard(logdir="runs"):
+    # Ensure the log directory exists
+    os.makedirs(logdir, exist_ok=True)
+
+    # Launch TensorBoard as a background process
+    tb = subprocess.Popen(
+        ["tensorboard", f"--logdir={logdir}", "--bind_all", "--port=6006"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+
+    # Optional: auto-open browser
+    webbrowser.open("http://localhost:6006")
+
+    return tb
 
 #***************************************************************************************************************#
 def _prompt_int(prompt_text, default=200):
@@ -68,11 +95,11 @@ def _prompt_yes_no(prompt_text, default=False):
 
 #***************************************************************************************************************#
 def _prompt_algorithm(default="dqn"):
-    raw_value = input("\nSelect algorithm [dqn/pg/a2c/ppo] (default dqn): ").strip().lower()
+    raw_value = input("\nSelect algorithm [dqn/pg/a2c/random] (default dqn): ").strip().lower()
     if not raw_value:
         return default
 
-    if raw_value in {"dqn", "pg", "a2c", "ppo"}:
+    if raw_value in {"dqn", "pg", "a2c", "random"}:
         return raw_value
 
     print(f"Invalid value '{raw_value}'. Using default {default}.")
@@ -126,481 +153,305 @@ def _save_agent_checkpoints(agent_policies, algorithm):
     print(f"Saved {algorithm.upper()} model checkpoints to {_checkpoint_dir()}")
 
 #***************************************************************************************************************#
-def _progress_bar(current, total, bar_length=40):
-    """Displays a progress bar."""
-    fraction = current / total
-    filled = int(fraction * bar_length)
-    bar = "#" * filled + "-" * (bar_length - filled)
-    print(f"\r[{bar}] {current}/{total} ({fraction*100:5.1f}%)", end="")
-    if current == total:
-        print()  # newline at end
+def run_DQN(num_episodes, verbose, env,  epsilon, epsilon_decay, epsilon_min, render, load_saved_model):
 
-#***************************************************************************************************************#
-def _plot_combined_reward_history(step_rewards, 
-    per_agent_rewards,
-    loss_history,
-    metric_history=None,
-    metric_label="Metric",
-    moving_avg_window=50,
-    output_path="reward_history_combined.png",):
+    t_board_writer = SummaryWriter(log_dir="runs/DQN_" + datetime.now().strftime("%m_%d_%H%M"), comment="Deep Q-Network")
 
-    """Plot and save reward, loss, per-agent reward, and algorithm metric trends."""
-    if per_agent_rewards is None:
-        per_agent_rewards = {}
-    if metric_history is None:
-        metric_history = []
+    if verbose:
+        print("Verbose logging enabled. Detailed information will be printed during training.")
+        log_path = Path(f"logs/DQN_" + datetime.now().strftime("%m_%d_%H%M") + ".log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if len(step_rewards) == 0 and not per_agent_rewards and len(loss_history) == 0 and len(metric_history) == 0:
-        print("No rewards collected. Skipping reward graph.")
-        return
+        logging.basicConfig(
+            filename=log_path,
+            filemode='w',
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
 
-    fig, (ax_overall, ax_loss, ax_agents, ax_metric) = plt.subplots(4, 1, figsize=(12, 18), sharex=True)
-
-    if len(step_rewards) > 0:
-        rewards_arr = np.asarray(step_rewards, dtype=np.float32)
-        ax_overall.plot(rewards_arr, color="steelblue", linewidth=1.0, alpha=0.8, label="Episode Total Reward")
-
-        if len(rewards_arr) >= moving_avg_window:
-            kernel = np.ones(moving_avg_window, dtype=np.float32) / moving_avg_window
-            moving_avg = np.convolve(rewards_arr, kernel, mode="valid")
-            moving_x = np.arange(moving_avg_window - 1, len(rewards_arr))
-            ax_overall.plot(
-                moving_x,
-                moving_avg,
-                color="crimson",
-                linewidth=2.0,
-                label=f"{moving_avg_window}-Episode Moving Avg",
-            )
-    else:
-        ax_overall.text(0.5, 0.5, "No overall reward data", ha="center", va="center", transform=ax_overall.transAxes)
-
-    ax_overall.legend()
-    ax_overall.set_ylabel("Reward")
-    ax_overall.grid(alpha=0.3)
-
-    if len(loss_history) > 0:
-        loss_arr = np.asarray(loss_history, dtype=np.float32)
-        ax_loss.plot(loss_arr, color="darkgreen", linewidth=1.5, alpha=0.9, label="Episode Mean Loss")
-
-        if len(loss_arr) >= moving_avg_window:
-            kernel = np.ones(moving_avg_window, dtype=np.float32) / moving_avg_window
-            moving_avg_loss = np.convolve(loss_arr, kernel, mode="valid")
-            moving_x = np.arange(moving_avg_window - 1, len(loss_arr))
-            ax_loss.plot(
-                moving_x,
-                moving_avg_loss,
-                color="goldenrod",
-                linewidth=2.0,
-                label=f"{moving_avg_window}-Episode Loss Avg",
-            )
-        ax_loss.legend()
-    else:
-        ax_loss.text(0.5, 0.5, "No loss data", ha="center", va="center", transform=ax_loss.transAxes)
-
-    ax_loss.set_ylabel("Loss")
-    ax_loss.grid(alpha=0.3)
-
-    has_agent_data = False
-    for agent_name, rewards in per_agent_rewards.items():
-        if len(rewards) > 0:
-            has_agent_data = True
-            arr = np.asarray(rewards, dtype=np.float32)
-            ax_agents.plot(arr, linewidth=1.2, alpha=0.8, label=f"{agent_name} reward")
-
-            if len(arr) >= moving_avg_window:
-                kernel = np.ones(moving_avg_window, dtype=np.float32) / moving_avg_window
-                moving_avg_agent = np.convolve(arr, kernel, mode="valid")
-                moving_x = np.arange(moving_avg_window - 1, len(arr))
-                ax_agents.plot(
-                    moving_x,
-                    moving_avg_agent,
-                    linewidth=2.0,
-                    alpha=0.9,
-                    linestyle="--",
-                    label=f"{agent_name} {moving_avg_window}-ep avg",
-                )
-
-    if has_agent_data:
-        ax_agents.legend(ncol=2)
-    else:
-        ax_agents.text(0.5, 0.5, "No per-agent reward data", ha="center", va="center", transform=ax_agents.transAxes)
-
-    ax_agents.set_ylabel("Reward")
-    ax_agents.grid(alpha=0.3)
-
-    if len(metric_history) > 0:
-        metric_arr = np.asarray(metric_history, dtype=np.float32)
-        ax_metric.plot(metric_arr, color="purple", linewidth=1.5, alpha=0.9, label=f"Episode {metric_label}")
-
-        if len(metric_arr) >= moving_avg_window:
-            kernel = np.ones(moving_avg_window, dtype=np.float32) / moving_avg_window
-            moving_avg_metric = np.convolve(metric_arr, kernel, mode="valid")
-            moving_x = np.arange(moving_avg_window - 1, len(metric_arr))
-            ax_metric.plot(
-                moving_x,
-                moving_avg_metric,
-                color="black",
-                linewidth=2.0,
-                label=f"{moving_avg_window}-Episode {metric_label} Avg",
-            )
-        ax_metric.legend()
-    else:
-        ax_metric.text(0.5, 0.5, f"No {metric_label.lower()} data", ha="center", va="center", transform=ax_metric.transAxes)
-
-    ax_metric.set_xlabel("Episode")
-    ax_metric.set_ylabel(metric_label)
-    ax_metric.grid(alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150)
-    print(f"Saved combined reward graph to {output_path}")
-    plt.show()
-
-#***************************************************************************************************************#
-def _export_training_history_csv(step_rewards, 
-                                 per_agent_rewards, 
-                                 loss_history, 
-                                 output_path="training_history.csv"):
-    """Export overall reward, per-agent reward, and loss history to a CSV file."""
-    if per_agent_rewards is None:
-        per_agent_rewards = {}
-
-    if len(step_rewards) == 0 and not per_agent_rewards and len(loss_history) == 0:
-        print("No training history collected. Skipping CSV export.")
-        return
-
-    agent_names = sorted(per_agent_rewards.keys())
-    max_rows = max(
-        len(step_rewards),
-        len(loss_history),
-        max((len(per_agent_rewards[name]) for name in agent_names), default=0),
-    )
-
-    headers = ["episode", "overall_reward", "mean_loss"] + [f"{agent}_reward" for agent in agent_names]
-
-    with open(output_path, "w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.writer(csv_file)
-        writer.writerow(headers)
-
-        for episode_idx in range(max_rows):
-            row = [episode_idx + 1]
-            row.append(step_rewards[episode_idx] if episode_idx < len(step_rewards) else "")
-            row.append(loss_history[episode_idx] if episode_idx < len(loss_history) else "")
-
-            for agent_name in agent_names:
-                agent_values = per_agent_rewards.get(agent_name, [])
-                row.append(agent_values[episode_idx] if episode_idx < len(agent_values) else "")
-
-            writer.writerow(row)
-
-    print(f"Saved training history CSV to {output_path}")
-
-
-#***************************************************************************************************************#
-def run_DQN(num_episodes=100, 
-            env = None, 
-            max_steps_per_episode=2000, 
-            epsilon = 1.0, 
-            epsilon_decay=0.9995, 
-            epsilon_min=0.1, 
-            render=True, 
-            render_sleep=0.02, 
-            verbose=False, 
-            load_saved_model=False):
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = f"training_history_dqn_{timestamp}.csv"
-    png_path = f"reward_history_dqn_{timestamp}.png"
-
-    #render_mode = "human" if render else None
-
-    observations, infos = env.reset()
+    observations, _ = env.reset()
 
     agent_policies = {}
     for agent, obs in observations.items():
         state_size = obs.size
         action_size = env.action_space(agent).n
+
         agent_policies[agent] = DQN_Logic(
             state_size=state_size,
             action_space=action_size,
-            learning_rate=0.0005,
-            gamma=0.99,
+            learning_rate=0.0001,
+            gamma=0.97,
             epsilon=epsilon,
             train_set_size=50000,
             batch_size=64,
-            target_update_steps=500,
+            target_update_steps=2000,
             hidden_layer_sizes=(128, 128),
         )
-
+    
     print(f"Initialized DQN policies for agents:", list(agent_policies.keys()))
 
     if load_saved_model:
         _load_agent_checkpoints(agent_policies, "dqn")
-        # Keep scheduler state aligned with loaded policies.
         epsilon = agent_policies[next(iter(agent_policies))].epsilon
-
-    episode_reward_history = []
-    episode_loss_history = []
-    epsilon_history = []
-    per_agent_reward_history = {agent: [] for agent in agent_policies}
-
+   
     try:
-        for episode in range(1, num_episodes + 1):
-            if not verbose:
-                _progress_bar(episode, num_episodes)
-            observations, infos = env.reset()
+        for episode in tqdm(range(1, num_episodes + 1)):
+            observations_before, _ = env.reset()
             episode_rewards = {agent: 0.0 for agent in agent_policies}
-            episode_losses = []
-            episode_steps = 0
-
-            for step in range(1, max_steps_per_episode + 1):
-                if not env.agents:
+            
+            step = 0
+            while True:
+                current_agents = list(observations_before.keys())
+                if len(current_agents) == 0:
                     break
 
                 actions = {}
-                observations_before = {}
 
-                for agent in env.agents:
-                    obs = observations[agent]
-                    observations_before[agent] = obs
-                    action = agent_policies[agent].get_action(obs)
-                    actions[agent] = int(np.clip(action, 0, env.action_space(agent).n - 1))
-
+                for agent in current_agents:
+                    actions[agent] = agent_policies[agent].get_action(observations_before[agent])
+                if verbose:
+                    logger.info("observations_before: %s", observations_before)
+                    logger.info("actions: %s", actions)
                 observations_after, rewards, terminations, truncations, infos = env.step(actions)
-
-                for agent, state in observations_before.items():
+                if verbose:
+                    logger.info("observations_after: %s", observations_after)
+                    logger.info("rewards: %s", rewards)
+                for agent in current_agents:
                     action = actions[agent]
                     reward = rewards.get(agent, 0.0)
                     done = terminations.get(agent, False) or truncations.get(agent, False)
-                    next_state = observations_after.get(agent, np.zeros_like(state))
-                    agent_policies[agent].remember(state, action, reward, next_state, done) 
+                    observation_after = observations_after.get(agent, observations_before[agent])
+                    observation_before = observations_before[agent]
+                    agent_policies[agent].remember(observation_before, action, reward, observation_after, done) 
                     episode_rewards[agent] += float(reward)
 
-                
-                for agent in observations_before:
-                    trained, loss = agent_policies[agent].learn()
-                    if trained:
-                        episode_losses.append(loss)
-
-                if render:
+                if step % 2 == 0:
+                    for agent in current_agents:
+                        trained, loss = agent_policies[agent].learn()
+                        if verbose and trained:
+                            logger.info("Agent %s trained with loss: %s", agent, loss)
+                    
+                step += 1
+                if render and step % 10 == 0:
                     env.render()
-                    if render_sleep > 0:
-                        time.sleep(render_sleep)
+                    pygame.event.pump()
+                    time.sleep(0.02)
 
-                observations = observations_after
-                episode_steps = step
+                observations_before = observations_after
 
-                if all(terminations.get(a, False) or truncations.get(a, False) for a in observations_before):
+                if all(terminations.get(a, False) or truncations.get(a, False) for a in current_agents):
                     break
 
-            epsilon = max(epsilon_min, epsilon - epsilon_decay)
+            epsilon = max(epsilon_min, epsilon * epsilon_decay)
             for agent in agent_policies.values():
                 agent.epsilon = epsilon
 
-            total_reward = sum(episode_rewards.values())
-            mean_loss = float(np.mean(episode_losses)) if episode_losses else 0.0
-
-            episode_reward_history.append(total_reward)
-            episode_loss_history.append(mean_loss)
-            epsilon_history.append(epsilon)
-
-            for agent in per_agent_reward_history:
-                per_agent_reward_history[agent].append(episode_rewards.get(agent, 0.0))
-
-            reward_summary = ", ".join(
-                f"{agent}={episode_rewards[agent]:.2f}"
-                for agent in sorted(episode_rewards)
-            )
-            metric_text = f"epsilon={epsilon:.4f}"
-
-            if verbose:
-                print(
-                    f"Episode {episode}/{num_episodes} | steps={episode_steps} | "
-                    f"algo=DQN | {metric_text} | "
-                    f"total_reward={total_reward:.2f} | mean_loss={mean_loss:.4f}"
-                )
-                print("  Per-agent rewards:", reward_summary)
-                print()
+            for agent in agent_policies:
+                t_board_writer.add_scalar(f"reward/{agent}", episode_rewards[agent], episode)
+                
+                for name, param in agent_policies[agent].target_model.named_parameters():
+                    t_board_writer.add_histogram(f"weights/{agent}/{name}", param.data.cpu(), episode)
+            
+            t_board_writer.add_scalar("Total Reward", sum(episode_rewards.values()), episode)
+            t_board_writer.add_scalar("Epsilon", epsilon, episode)
+            
     except KeyboardInterrupt:
         print("\nTraining interrupted by user. Saving progress...")
     
     finally:
         env.close()
 
-        _export_training_history_csv(
-            episode_reward_history,
-            per_agent_reward_history,
-            episode_loss_history,
-            output_path=csv_path,
-        )
-        _plot_combined_reward_history(
-            episode_reward_history,
-            per_agent_reward_history,
-            episode_loss_history,
-            metric_history=epsilon_history,
-            metric_label="Epsilon",
-            output_path=png_path,
-        )
         _save_agent_checkpoints(agent_policies, "dqn")
 
 #***************************************************************************************************************#
-def run_PG(num_episodes=100, env = None, 
-           max_steps_per_episode=2000, 
-           render=True, 
-           render_sleep=0.02, 
-           verbose=False, 
-           load_saved_model=False):
+def run_REINFORCE(num_episodes=100, verbose = True, env = None, render=True, load_saved_model=False):
+    
+    learning_rate = 3e-4
+    gamma = 0.99
+    entropy_coef = 0.01
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = f"training_history_pg_{timestamp}.csv"
-    png_path = f"reward_history_pg_{timestamp}.png"
+    t_board_writer = SummaryWriter(log_dir="runs/REINFORCE_" + datetime.now().strftime("%m_%d_%H%M"), comment="Policy Gradient with REINFORCE")
 
-    observations, infos = env.reset()
+    if verbose:
+        print("Verbose logging enabled. Detailed information will be printed during training.")
+        log_path = Path(f"logs/REINFORCE_" + datetime.now().strftime("%m_%d_%H%M") + ".log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
 
+        logging.basicConfig(
+            filename=log_path,
+            filemode='w',
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+    
+    observations_before, _ = env.reset()
     agent_policies = {}
-    for agent, obs in observations.items():
+    for agent, obs in observations_before.items():
         state_size = obs.size
         action_size = env.action_space(agent).n
         
         agent_policies[agent] = ReinforcePolicy(
             state_size=state_size,
             action_space=action_size,
-            learning_rate=0.0005,
-            gamma=0.99,
-            entropy_coef=0.01,
+            learning_rate=learning_rate,
+            gamma=gamma,
+            entropy_coef=entropy_coef,
             hidden_layer_sizes=(128, 128),
         )
 
-    print(f"Initialized PG policies for agents:", list(agent_policies.keys()))
+    sample_agent = next(iter(agent_policies.values()))
+    sample_state = torch.zeros(1, sample_agent.state_size).to(sample_agent.device)
+    t_board_writer.add_graph(sample_agent.policy, sample_state)
+
+    print(f"Initialized REINFORCE policies for agents:", list(agent_policies.keys()))
 
     if load_saved_model:
-        _load_agent_checkpoints(agent_policies, "pg")
-
-    episode_reward_history = []
-    episode_loss_history = []
-    entropy_history = []
-    per_agent_reward_history = {agent: [] for agent in agent_policies}
+        _load_agent_checkpoints(agent_policies, "reinforce")
 
     try:
-        for episode in range(1, num_episodes + 1):
-            if not verbose:
-                _progress_bar(episode, num_episodes)
-            observations, infos = env.reset()
+        for episode in tqdm(range(1, num_episodes + 1)):
+            observations_before, _ = env.reset()
             episode_rewards = {agent: 0.0 for agent in agent_policies}
-            episode_losses = []
-            episode_steps = 0
-
-            for step in range(1, max_steps_per_episode + 1):
-                if not env.agents:
+            step = 0
+            while True:
+                if verbose:
+                    logger.info("observations_before: %s", observations_before)
+                current_agents = list(observations_before.keys())
+                if len(current_agents) == 0:
                     break
 
                 actions = {}
-                observations_before = {}
 
-                for agent in env.agents:
-                    obs = observations[agent]
-                    observations_before[agent] = obs
-                    action = agent_policies[agent].get_action(obs)
-                    actions[agent] = int(np.clip(action, 0, env.action_space(agent).n - 1))
-
-                observations_after, rewards, terminations, truncations, infos = env.step(actions)
-
-                for agent, state in observations_before.items():
+                for agent in current_agents:
+                    action, log_prob, entropy = agent_policies[agent].get_action(observations_before[agent])
+                    actions[agent] = action
+                    agent_policies[agent].remember(0.0, log_prob, entropy)
+                if verbose:
+                    logger.info("actions: %s", actions)
+                observations_after, rewards, terminations, truncations, _ = env.step(actions)
+                if verbose:
+                    logger.info("observations_after: %s", observations_after)
+                    logger.info("rewards: %s", rewards)
+                for agent in current_agents:
                     reward = rewards.get(agent, 0.0)
                     done = terminations.get(agent, False) or truncations.get(agent, False)
-                    agent_policies[agent].remember_reward(reward) 
+                    if agent_policies[agent].rewards:
+                        # Update the reward for the most recent sampled action.
+                        agent_policies[agent].rewards[-1] = torch.tensor(
+                            reward, dtype=torch.float32, device=agent_policies[agent].device
+                        )
+                    if verbose:
+                        logger.info("Agent %s received reward: %s", agent, reward)
                     episode_rewards[agent] += float(reward)
 
-                
-                if render:
+                step += 1
+                if render and step % 10 == 0:
                     env.render()
-                    if render_sleep > 0:
-                        time.sleep(render_sleep)
+                    pygame.event.pump()
+                    time.sleep(0.02)
 
-                observations = observations_after
-                episode_steps = step
+                observations_before = observations_after
+                if verbose:
+                    logger.info("observations_before: %s", observations_before)
 
-                if all(terminations.get(a, False) or truncations.get(a, False) for a in observations_before):
+                if all(terminations.get(a, False) or truncations.get(a, False) for a in env.agents):
                     break
 
-            # REINFORCE update happens once per episode.
             for agent in agent_policies:
-                trained, loss = agent_policies[agent].learn()
+                t_board_writer.add_scalar(f"reward/{agent}", episode_rewards[agent], episode)
+                trained, loss, entropy_bonus = agent_policies[agent].learn()
                 if trained:
-                    episode_losses.append(loss)
-
-            total_reward = sum(episode_rewards.values())
-            mean_loss = float(np.mean(episode_losses)) if episode_losses else 0.0
-
-            episode_reward_history.append(total_reward)
-            episode_loss_history.append(mean_loss)
-            entropy_history.append(agent_policies[next(iter(agent_policies))].last_entropy_mean)
-
-            for agent in per_agent_reward_history:
-                per_agent_reward_history[agent].append(episode_rewards.get(agent, 0.0))
-
-            reward_summary = ", ".join(
-                f"{agent}={episode_rewards[agent]:.2f}"
-                for agent in sorted(episode_rewards)
-            )
-            metric_text = f"entropy={agent_policies[next(iter(agent_policies))].last_entropy_mean:.4f}"
-
-            if verbose:
-                print(
-                    f"Episode {episode}/{num_episodes} | steps={episode_steps} | "
-                    f"algo=PG | {metric_text} | "
-                    f"total_reward={total_reward:.2f} | mean_loss={mean_loss:.4f}"
-                )
-                print("  Per-agent rewards:", reward_summary)
+                    t_board_writer.add_scalar(f"Entropy Bonus/{agent}", entropy_bonus, episode)
+                    for name, param in agent_policies[agent].policy.named_parameters():
+                        t_board_writer.add_histogram(f"weights/{agent}/{name}", param.data.cpu(), episode)
+            
+            t_board_writer.add_scalar("Total Reward", sum(episode_rewards.values()), episode)
+    
     except KeyboardInterrupt:
         print("\nTraining interrupted by user. Saving progress...")
     
     finally:
         env.close()
 
-        _export_training_history_csv(
-            episode_reward_history,
-            per_agent_reward_history,
-            episode_loss_history,
-            output_path=csv_path,
-        )
-        _plot_combined_reward_history(
-            episode_reward_history,
-            per_agent_reward_history,
-            episode_loss_history,
-            metric_history=entropy_history,
-            metric_label="Entropy",
-            output_path=png_path,
-        )
-        _save_agent_checkpoints(agent_policies, "pg")
+        _save_agent_checkpoints(agent_policies, "reinforce")
+#***************************************************************************************************************#
+def run_random(num_episodes=100, env = None, render=True):
+
+    observations, _ = env.reset()
+    t_board_writer = SummaryWriter(log_dir="runs/RANDOM_" + datetime.now().strftime("%m_%d_%H%M"), comment="Random Policy")
+
+    print(f"Initialized random policies for agents:", list(observations.keys()))
+   
+    try:
+        for episode in tqdm(range(1, num_episodes + 1)):
+            observations_before, _ = env.reset()
+            episode_rewards = {agent: 0.0 for agent in observations}
+            
+            step = 0
+            while True:
+                current_agents = observations_before.keys()
+                if len(current_agents) == 0:
+                    break
+
+                actions = {}
+
+                for agent in current_agents:
+                    actions[agent] = random.choice(range(env.action_space(agent).n))
+                observations_after, rewards, terminations, truncations, infos = env.step(actions)
+                for agent in current_agents:
+                    reward = rewards.get(agent, 0.0)
+                    done = terminations.get(agent, False) or truncations.get(agent, False)
+                    episode_rewards[agent] += float(reward)
+                    
+                step += 1
+                if render and step % 10 == 0:
+                    env.render()
+                    time.sleep(0.02)
+
+                if all(terminations.get(a, False) or truncations.get(a, False) for a in observations_before):
+                    break
+            
+            t_board_writer.add_scalar("Total Reward", sum(episode_rewards.values()), episode)
+    
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Saving progress...")
+    
+    finally:
+        env.close()
 
 #***************************************************************************************************************#
-def run_A2C(num_episodes=100, 
-            env=None, 
-            max_steps_per_episode=2000, 
-            render=True, 
-            render_sleep=0.02, 
-            verbose=False, 
-            load_saved_model=False,):
+def run_A2C(num_episodes=100, env=None, render=True, load_saved_model=False):
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = f"training_history_a2c_{timestamp}.csv"
-    png_path = f"reward_history_a2c_{timestamp}.png"
+    learning_rate = 3e-4
+    gamma = 0.99
+    entropy_coef_start = 0.01
+    entropy_coef_decay = 0.999
+    entropy_coef_min = 0.001
+    rollout_length = 32
 
-    observations, infos = env.reset()
+    t_board_writer = SummaryWriter(
+        log_dir="runs/A2C_" + datetime.now().strftime("%m_%d_%H%M"),
+        comment="Advantage Actor-Critic"
+    )
 
-    # Initialize A2C policies
+    # Reset environment
+    observations_before, _ = env.reset()
+
+    # Initialize policies
     agent_policies = {}
-    for agent, obs in observations.items():
+    for agent, obs in observations_before.items():
         state_size = obs.size
         action_size = env.action_space(agent).n
 
         agent_policies[agent] = A2C_Logic(
             state_size=state_size,
             action_space=action_size,
-            learning_rate=0.0005,
-            gamma=0.99,
-            entropy_coef=0.01,
+            learning_rate=learning_rate,
+            gamma=gamma,
+            entropy_coef=entropy_coef_start,
+            rollout_length=rollout_length,
             hidden_layer_sizes=(128, 128),
         )
 
@@ -609,299 +460,150 @@ def run_A2C(num_episodes=100,
     if load_saved_model:
         _load_agent_checkpoints(agent_policies, "a2c")
 
-    episode_reward_history = []
-    episode_loss_history = []
-    entropy_history = []
-    per_agent_reward_history = {agent: [] for agent in agent_policies}
-
     try:
-        for episode in range(1, num_episodes + 1):
-            if not verbose:
-                _progress_bar(episode, num_episodes)
+        for episode in tqdm(range(1, num_episodes + 1)):
 
-            observations, infos = env.reset()
+            current_entropy_coef = max(
+                entropy_coef_min,
+                entropy_coef_start * (entropy_coef_decay ** (episode - 1))
+            )
+            for policy in agent_policies.values():
+                policy.entropy_coef = current_entropy_coef
+
+            observations_before, _ = env.reset()
+
             episode_rewards = {agent: 0.0 for agent in agent_policies}
-            episode_losses = []
-            episode_steps = 0
+            episode_losses = {agent: [] for agent in agent_policies}
+            episode_entropies = {agent: [] for agent in agent_policies}
 
-            for step in range(1, max_steps_per_episode + 1):
-                if not env.agents:
+            step = 0
+
+            while True:
+
+                current_agents = list(observations_before.keys())
+                if len(current_agents) == 0:
                     break
 
+                # Select actions
                 actions = {}
-                log_probs = {}
-                entropies = {}
-                observations_before = {}
+                for agent in current_agents:
+                    actions[agent] = agent_policies[agent].get_action(observations_before[agent])
 
-                for agent in env.agents:
-                    obs = observations[agent]
-                    observations_before[agent] = obs
+                # Step environment
+                observations_after, rewards, terminations, truncations, _ = env.step(actions)
 
-                    action, log_prob, entropy = agent_policies[agent].get_action(obs)
-                    actions[agent] = int(action)
-                    log_probs[agent] = log_prob
-                    entropies[agent] = entropy
-
-                
-                observations_after, rewards, terminations, truncations, infos = env.step(actions)
-
-                # ---- A2C LEARNING ----
-                for agent, state in observations_before.items():
+                # Store transitions
+                for agent in current_agents:
                     reward = rewards.get(agent, 0.0)
                     done = terminations.get(agent, False) or truncations.get(agent, False)
-                    next_state = observations_after.get(agent, np.zeros_like(state))
+                    episode_rewards[agent] += float(reward)
 
-                    trained, loss = agent_policies[agent].learn(
-                        state=state,
-                        action=actions[agent],
-                        reward=reward,
-                        next_state=next_state,
-                        done=done,
+                    next_state = observations_after.get(agent, observations_before[agent])
+                    agent_policies[agent].remember(
+                        observations_before[agent],
+                        actions[agent],
+                        reward,
+                        next_state,
+                        done
                     )
 
-                    if trained:
-                        episode_losses.append(loss)
+                # Update once each agent buffer is truly full.
+                for agent in current_agents:
+                    if len(agent_policies[agent].memory) >= rollout_length:
+                        trained, loss, entropy = agent_policies[agent].learn()
+                        if trained:
+                            episode_losses[agent].append(loss)
+                            episode_entropies[agent].append(entropy)
 
-                    episode_rewards[agent] += float(reward)
-
-                # ---- RENDER ----
-                if render:
+                # Render
+                if render and step % 10 == 0:
                     env.render()
-                    if render_sleep > 0:
-                        time.sleep(render_sleep)
+                    pygame.event.pump()
 
-                observations = observations_after
-                episode_steps = step
+                # Move forward
+                observations_before = observations_after
+                step += 1
 
-                # End episode if all agents terminated
-                if all(terminations.get(a, False) or truncations.get(a, False) for a in observations_before):
+                # Episode termination condition
+                if all(terminations.get(a, False) or truncations.get(a, False)
+                       for a in current_agents):
                     break
 
-            # -----------------------------
-            # END OF EPISODE
-            # -----------------------------
-            total_reward = sum(episode_rewards.values())
-            mean_loss = float(np.mean(episode_losses)) if episode_losses else 0.0
+            # Flush leftover rollout so short final segments also train.
+            for agent in agent_policies:
+                if len(agent_policies[agent].memory) > 0:
+                    trained, loss, entropy = agent_policies[agent].learn()
+                    if trained:
+                        episode_losses[agent].append(loss)
+                        episode_entropies[agent].append(entropy)
 
-            episode_reward_history.append(total_reward)
-            episode_loss_history.append(mean_loss)
-            entropy_history.append(0.0)  # optional: track entropy if desired
+            # Logging
+            for agent in agent_policies:
+                t_board_writer.add_scalar(f"reward/{agent}", episode_rewards[agent], episode)
 
-            for agent in per_agent_reward_history:
-                per_agent_reward_history[agent].append(episode_rewards.get(agent, 0.0))
+                for name, param in agent_policies[agent].policy.named_parameters():
+                    t_board_writer.add_histogram(f"{agent}/weights{name}", param.data.cpu(), episode)
+                    if param.grad is not None:
+                        t_board_writer.add_histogram(f"{agent}/gradients{name}", param.grad.data.cpu(), episode)
 
-            if verbose:
-                print(
-                    f"Episode {episode}/{num_episodes} | steps={episode_steps} | "
-                    f"algo=A2C | total_reward={total_reward:.2f} | mean_loss={mean_loss:.4f}"
-                )
+                avg_loss = sum(episode_losses[agent]) / len(episode_losses[agent]) if episode_losses[agent] else 0.0
+                avg_entropy = sum(episode_entropies[agent]) / len(episode_entropies[agent]) if episode_entropies[agent] else 0.0
+
+                t_board_writer.add_scalar(f"loss/{agent}", avg_loss, episode)
+                t_board_writer.add_scalar(f"entropy/{agent}", avg_entropy, episode)
+
+            t_board_writer.add_scalar("Total Reward", sum(episode_rewards.values()), episode)
+            t_board_writer.add_scalar("entropy_coef", current_entropy_coef, episode)
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user. Saving progress...")
 
     finally:
         env.close()
-
-        _export_training_history_csv(
-            episode_reward_history,
-            per_agent_reward_history,
-            episode_loss_history,
-            output_path=csv_path,
-        )
-
-        _plot_combined_reward_history(
-            episode_reward_history,
-            per_agent_reward_history,
-            episode_loss_history,
-            metric_history=entropy_history,
-            metric_label="Entropy",
-            output_path=png_path,
-        )
-
         _save_agent_checkpoints(agent_policies, "a2c")
 
-
-#*********************************************************************************#
-def run_PPO(
-    num_episodes=100,
-    env=None,
-    max_steps_per_episode=2000,
-    render=True,
-    render_sleep=0.02,
-    verbose=False,
-    load_saved_model=False,
-):
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = f"training_history_ppo_{timestamp}.csv"
-    png_path = f"reward_history_ppo_{timestamp}.png"
-
-    observations, infos = env.reset()
-
-    agent_policies = {}
-    for agent, obs in observations.items():
-        state_size = obs.size
-        action_size = env.action_space(agent).n
-
-        agent_policies[agent] = PPOPolicy(
-            state_size=state_size,
-            action_space=action_size,
-            learning_rate=0.0003,
-            gamma=0.99,
-            lam=0.95,
-            clip_eps=0.2,
-            entropy_coef=0.01,
-            value_coef=0.5,
-            batch_size=256,
-            update_epochs=4,
-            hidden_layer_sizes=(128, 128),
-        )
-
-    print("Initialized PPO policies for agents:", list(agent_policies.keys()))
-
-    if load_saved_model:
-        _load_agent_checkpoints(agent_policies, "ppo")
-
-    episode_reward_history = []
-    episode_loss_history = []
-    entropy_history = []
-    per_agent_reward_history = {agent: [] for agent in agent_policies}
-
-    try:
-        for episode in range(1, num_episodes + 1):
-            if not verbose:
-                _progress_bar(episode, num_episodes)
-
-            observations, infos = env.reset()
-            episode_rewards = {agent: 0.0 for agent in agent_policies}
-            episode_losses = []
-            episode_steps = 0
-
-            for step in range(1, max_steps_per_episode + 1):
-                if not env.agents:
-                    break
-
-                actions = {}
-                observations_before = {}
-
-                for agent in env.agents:
-                    obs = observations[agent]
-                    observations_before[agent] = obs
-                    action = agent_policies[agent].get_action(obs)
-                    actions[agent] = int(action)
-
-                observations_after, rewards, terminations, truncations, infos = env.step(actions)
-
-                for agent, state in observations_before.items():
-                    reward = rewards.get(agent, 0.0)
-                    done = terminations.get(agent, False) or truncations.get(agent, False)
-                    agent_policies[agent].remember_reward(reward, done)
-                    episode_rewards[agent] += float(reward)
-
-                if render:
-                    env.render()
-                    if render_sleep > 0:
-                        time.sleep(render_sleep)
-
-                observations = observations_after
-                episode_steps = step
-
-                if all(terminations.get(a, False) or truncations.get(a, False) for a in observations_before):
-                    break
-
-            # PPO update happens once per episode
-            for agent in agent_policies:
-                trained, loss = agent_policies[agent].learn()
-                if trained:
-                    episode_losses.append(loss)
-
-            total_reward = sum(episode_rewards.values())
-            mean_loss = float(np.mean(episode_losses)) if episode_losses else 0.0
-
-            episode_reward_history.append(total_reward)
-            episode_loss_history.append(mean_loss)
-            entropy_history.append(0.0)  # PPO entropy is inside loss, but you can track it if you want
-
-            for agent in per_agent_reward_history:
-                per_agent_reward_history[agent].append(episode_rewards.get(agent, 0.0))
-
-            if verbose:
-                print(
-                    f"Episode {episode}/{num_episodes} | steps={episode_steps} | "
-                    f"algo=PPO | total_reward={total_reward:.2f} | mean_loss={mean_loss:.4f}"
-                )
-
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user. Saving progress...")
-
-    finally:
-        env.close()
-
-        _export_training_history_csv(
-            episode_reward_history,
-            per_agent_reward_history,
-            episode_loss_history,
-            output_path=csv_path,
-        )
-        _plot_combined_reward_history(
-            episode_reward_history,
-            per_agent_reward_history,
-            episode_loss_history,
-            metric_history=entropy_history,
-            metric_label="Entropy",
-            output_path=png_path,
-        )
-        _save_agent_checkpoints(agent_policies, "ppo")
 
 #*********************************************************************************#
 if __name__ == "__main__":
     selected_algorithm = _prompt_algorithm(default="dqn")
     load_saved_model = _prompt_yes_no("Load saved model on start?", default=False)
-    num_episodes = _prompt_int("Enter number of episodes", default=100)
+    num_episodes = _prompt_int("Enter number of episodes", default=3000)
     headless = _prompt_yes_no("Run headless?", default=True)
-    verbose = _prompt_yes_no("Verbose printing?", default=False)
+    verbose = _prompt_yes_no("Enable verbose logging?", default=False)
+
+    if selected_algorithm == "dqn":
+        initial_epsilon = _prompt_float("Set initial epsilon for DQN", default=1.0, min_value=0.0, max_value=1.0)
+
+    tb_process = launch_tensorboard("runs")
 
     env = knights_archers_zombies_v10.parallel_env(
         render_mode="human" if not headless else None,
-        spawn_rate=5,
+        spawn_rate=1,
+        num_archers=2,
+        num_knights=2,
+        max_zombies=1,
+        max_arrows=2,
         max_cycles=2000
     )
 
     if selected_algorithm == "dqn":
-        initial_epsilon = _prompt_float("Set initial epsilon for DQN", default=1.0, min_value=0.0, max_value=1.0)
-        epsilon_min = 0.1  # You can adjust this value as needed
-        epsilon_decay = (initial_epsilon - epsilon_min) / (num_episodes / 2) 
         run_DQN(
             num_episodes=num_episodes,
-            env=env,
-            max_steps_per_episode=2000,
-            epsilon=initial_epsilon,
-            epsilon_decay=epsilon_decay,
-            epsilon_min=epsilon_min,
-            render=not headless,
-            render_sleep=0.02,
             verbose=verbose,
+            env=env,
+            epsilon=initial_epsilon,
+            epsilon_decay=0.9997,
+            epsilon_min=0.1,
+            render=not headless,
             load_saved_model=load_saved_model,
         )
 
-    if selected_algorithm == "ppo":
-        run_PPO(
-            num_episodes=num_episodes,
-            env=env,
-            max_steps_per_episode=2000,
-            render=not headless,
-            render_sleep=0.02,
-            verbose=verbose,
-            load_saved_model=load_saved_model,
-        )
     if selected_algorithm == "pg":    
-        run_PG(
+        run_REINFORCE(
             num_episodes=num_episodes,
             env=env,
-            max_steps_per_episode=2000,
-            render=not headless,
-            render_sleep=0.02,
             verbose=verbose,
+            render=not headless,
             load_saved_model=load_saved_model,
         )
     
@@ -909,9 +611,12 @@ if __name__ == "__main__":
         run_A2C(
             num_episodes=num_episodes,
             env=env,
-            max_steps_per_episode=2000,
             render=not headless,
-            render_sleep=0.02,
-            verbose=verbose,
             load_saved_model=load_saved_model,
+        )
+    if selected_algorithm == "random":    
+        run_random(
+            num_episodes=num_episodes,
+            env=env,
+            render=not headless,
         )

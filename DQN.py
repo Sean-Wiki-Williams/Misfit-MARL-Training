@@ -15,7 +15,7 @@ DONE = 4
 
 class DQN_Logic:
 
-    def __init__(self, state_size=None, action_space=None, learning_rate=0.0005, gamma=0.99, epsilon=1.0, train_set_size=50000, batch_size=64, target_update_steps=500, hidden_layer_sizes=(128, 128)):
+    def __init__(self, state_size, action_space, learning_rate, gamma, epsilon, train_set_size, batch_size, target_update_steps, hidden_layer_sizes):
         """
         Description: Initializes model configuration, optimizer, replay memory, and runtime device.
         @:param input_array_size: Integer size of the input state vector.
@@ -38,25 +38,11 @@ class DQN_Logic:
         
         self.model = self.build_model()
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        # Huber loss is more robust than MSE when TD errors spike.
         self.loss_fn = nn.SmoothL1Loss()
 
         self.target_model = self.build_model()
         self.target_model.load_state_dict(self.model.state_dict())
         self.target_model.eval()
-
-        self.loaded_config = {
-            "device": str(self.device),
-            "learning_rate": float(self.learning_rate),
-            "action_space": int(self.action_space),
-            "state_size": int(self.state_size),
-            "gamma": float(self.gamma),
-            "epsilon": float(self.epsilon),
-            "train_set_size": int(self.train_set_size),
-            "batch_size": int(self.batch_size),
-            "target_update_steps": int(self.target_update_steps),
-            "hidden_layer_sizes": list(self.hidden_layer_sizes),
-        }
 
     #*********************************************************************************#
     def _flatten_state(self, state):
@@ -111,22 +97,25 @@ class DQN_Logic:
         rewards_tensor     = torch.as_tensor(rewards,     device=self.device)
         dones_tensor       = torch.as_tensor(dones,       device=self.device)
 
-        self.model.eval()
-        self.target_model.eval()
-
-        # Q(s, a) from online net
+        # Online network Q(s, a)
         q_values = self.model(states_tensor)                      # [batch, num_actions]
         q_sa = q_values.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
 
         # Q(s', a') from target net
         with torch.no_grad():
-            next_q_values = self.target_model(next_states_tensor) # [batch, num_actions]
-            max_next_q = next_q_values.max(dim=1)[0]
-            targets = rewards_tensor + self.gamma * max_next_q * (1.0 - dones_tensor)
+            # Online network Q(s', a') to select the best action
+            #next_actions = self.model(next_states_tensor).argmax(dim=1)
+
+            # Target network evaluates that action
+            next_q_values = self.target_model(next_states_tensor)
+            max_next_q_values = next_q_values.max(dim=1)[0]
+            
+            # Calculate TD Targets: r + γ * max_a' Q(s', a') * (1 - done)
+            target_q_values = rewards_tensor + self.gamma * max_next_q_values * (1.0 - dones_tensor)
 
         # one gradient step
         self.model.train()
-        loss = self.loss_fn(q_sa, targets)
+        loss = self.loss_fn(q_sa, target_q_values)
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -137,7 +126,6 @@ class DQN_Logic:
         if self.learn_step_counter % self.target_update_steps == 0:
             self.target_model.load_state_dict(self.model.state_dict())
             self.target_model.eval()
-            #self.save("last_save.pt")
         
         return True, loss.item()
 

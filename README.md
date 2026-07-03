@@ -1,95 +1,138 @@
-# 🏹 Knights, Archers, Zombies (KAZ) Multi-Agent RL Training Framework
+# Multi-Agent Reinforcement Learning for Knights, Archers, Zombies
 
-This repository provides an interactive multi-agent reinforcement learning (MARL) training orchestration pipeline. It utilizes [PettingZoo's Butterfly library](https://pettingzoo.farama.org/environments/butterfly/knights_archers_zombies/) to simulate the **Knights, Archers, Zombies (v10)** parallel environment, allowing you to train multi-agent groups using value-based or policy-gradient approaches.
+This project trains multiple agents in PettingZoo's Knights, Archers, Zombies environment using independent learners per agent.
 
----
+Implemented learners:
+- DQN (value-based)
+- REINFORCE (policy gradient)
+- A2C (actor-critic)
+- Random baseline
 
-## 🗺️ System Overview
+## Environment
 
-The framework orchestrates decentralized training with centralized execution hooks across custom reinforcement learning agents:
-* **DQN (`DQN_Logic`):** Deep Q-Network with Experience Replay buffers and decoupled Target Networks.
-* **PG (`ReinforcePolicy`):** REINFORCE Policy Gradient with baseline-subtracted advantage normalization and explicit exploration tracking via entropy.
+- Environment: `pettingzoo.butterfly.knights_archers_zombies_v10`
+- API mode: parallel environment
+- Default environment settings in `main.py`:
+  - `num_archers=2`
+  - `num_knights=2`
+  - `spawn_rate=1`
+  - `max_zombies=1`
+  - `max_arrows=2`
+  - `max_cycles=2000`
 
-### Architecture Workflow
-1. **Instantiation:** Detects baseline environment dimensions (`state_size`, `action_space`) per agent dynamically.
-2. **Interactive Handshake:** Prompts the user to select the algorithm type, deployment settings, runtime hyperparameters, and headless states.
-3. **Training Loop:** Executes decentralized operations, tracking individual metrics inside parallelized environment steps.
-4. **Data Aggregation:** Automatically serializes weights, exports historical tables (.CSV), and builds trend plots (.PNG) upon completion or cancellation.
+## Repository Structure
 
----
+- `main.py`: training entrypoint, CLI prompts, TensorBoard launcher, training loops
+- `DQN.py`: `DQN_Logic` implementation
+- `REINFORCE.py`: `ReinforcePolicy` implementation
+- `A2C.py`: `A2C_Logic` implementation
+- `PPO.py`: PPO policy class (currently not wired into `main.py` CLI)
+- `requirements.txt`: project dependencies
 
-## 🛠️ Script Features & API Core Functions
+Generated during runs:
+- `runs/`: TensorBoard event files
+- `logs/`: verbose run logs (when enabled)
+- `checkpoints/`: saved model checkpoints (`*.pt`)
 
-| Function / Method | Type / Signature | Return Profile | Description |
-| :--- | :--- | :--- | :--- |
-| `run_DQN(...)` | Core Loop | `None` | Manages the primary interactive step loop using Deep Q-Learning rules, handling epsilon decay steps globally. |
-| `run_PG(...)` | Core Loop | `None` | Manages the single-trajectory Monte Carlo collection loop using Policy Gradient criteria, stepping updates at episode boundaries. |
-| `get_action(state)` | Method | `int` | Samples an action from the policy using the current observation context. |
-| `_plot_combined_reward_history(...)` | Utility | `None` | Uses Matplotlib to generate a 4-panel grid tracking Overall Reward, Losses, Per-Agent Profiles, and Exploitation Metrics. |
-| `_export_training_history_csv(...)` | Utility | `None` | Compiles raw metric data arrays directly into structured tables for post-process evaluation. |
-| `_load_agent_checkpoints(...)` | Disk I/O | `None` | Restores neural network states relative to specific agent name indexes. |
-| `_save_agent_checkpoints(...)` | Disk I/O | `None` | Handles state serialization dynamically across unique sub-directories. |
+## Setup
 
----
+### 1) Create and activate a virtual environment
 
-## 🚀 Getting Started
+PowerShell:
 
-### Prerequisites
-
-Ensure you have your custom `DQN.py` (housing `DQN_Logic`) and `PG.py` (housing `ReinforcePolicy`) within the execution path. Install dependencies:
-
-```bash
-pip install torch numpy matplotlib pettingzoo[butterfly]
-
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
 
-### Execution Pipeline
+### 2) Install dependencies
 
-Launch the main orchestration script from your terminal:
+```powershell
+pip install -r requirements.txt
+```
 
-```bash
+Notes:
+- On Windows, `requirements.txt` pulls the CUDA 12.1 PyTorch wheel.
+- If you do not have a CUDA-compatible GPU/driver, install CPU PyTorch manually first, then install the rest.
+
+## Run Training
+
+```powershell
 python main.py
-
 ```
 
-Upon launching, the interactive CLI will guide you through setup configuration profiles:
+You will be prompted for:
+- Algorithm: `dqn`, `pg`, `a2c`, or `random`
+- Whether to load saved model weights from `checkpoints/`
+- Number of episodes
+- Headless mode
+- Verbose logging
+- Initial epsilon (DQN only)
+
+Example prompt flow:
 
 ```text
-Select algorithm [dqn/pg] (default dqn): dqn
-
+Select algorithm [dqn/pg/a2c/random] (default dqn): dqn
 Load saved model on start? [y/N]: n
-
-Enter number of episodes (default 200): 150
-
+Enter number of episodes (default 3000): 1000
 Run headless? [Y/n]: y
-
-Verbose printing? [y/N]: n
-
+Enable verbose logging? [y/N]: n
 Set initial epsilon for DQN (default 1.0): 1.0
-
 ```
 
----
+## Checkpoints
 
-## 📊 Analytics & Training Outputs
+Checkpoints are automatically saved at the end of training (including KeyboardInterrupt handling):
+- DQN: `checkpoints/dqn_<agent_name>.pt`
+- REINFORCE: `checkpoints/reinforce_<agent_name>.pt`
+- A2C: `checkpoints/a2c_<agent_name>.pt`
 
-When training concludes (or if interrupted by a `KeyboardInterrupt` / `Ctrl+C`), the system executes a graceful shutdown routine to prevent data loss. The following artifacts are written to your local working directory:
+If "Load saved model on start?" is enabled, matching checkpoint files are loaded per agent if found.
 
-### 1. File Artifact Generation Matrix
+## TensorBoard
 
-* **`checkpoints/`**: A directory containing independent PyTorch state modules separated by naming metrics (e.g., `dqn_archer_0.pt`, `dqn_knight_0.pt`).
-* **`training_history_[algo]_[timestamp].csv`**: Tabular dataset detailing overall reward histories, mean step-level losses, and per-agent returns across each episode index.
-* **`reward_history_[algo]_[timestamp].png`**: High-resolution 4-subplot visualization displaying moving window metrics.
+`main.py` starts TensorBoard automatically on port `6006` and attempts to open a browser tab.
 
-### 2. Output Panel Breakdown
+Log directories are created per run, for example:
+- `runs/DQN_MM_DD_HHMM`
+- `runs/REINFORCE_MM_DD_HHMM`
+- `runs/A2C_MM_DD_HHMM`
+- `runs/RANDOM_MM_DD_HHMM`
 
-The generated graph provides a vertical overview tracking:
+If auto-open fails, open manually:
 
-* **Overall Reward:** Aggregated group returns alongside an $N$-episode rolling average trend line.
-* **Training Loss:** Mean optimization costs highlighting model convergence or gradient spikes.
-* **Per-Agent Rewards:** Individual returns tracking behavioral discrepancies between sub-classes (e.g., *Knights* vs. *Archers*).
-* **Algorithmic Metric Tracking:** Dynamic tracking mapping parameter transitions over time (**Epsilon** for DQN loops or **Entropy** for PG environments).
-
+```text
+http://localhost:6006
 ```
 
+## Current CLI Algorithms
+
+- `dqn`: trains independent DQN policies with replay memory and target networks
+- `pg`: trains independent REINFORCE policies
+- `a2c`: trains independent actor-critic policies with rollout updates
+- `random`: random-action baseline for comparison
+
+## Notes and Limitations
+
+- `PPO.py` exists, but PPO is not currently selectable from the `main.py` CLI.
+- Training/log/checkpoint folders are ignored in git by default (`.gitignore`).
+
+## Troubleshooting
+
+- TensorBoard command not found:
+  - Install it in your active venv: `pip install tensorboard`
+- No render window appears:
+  - Disable headless mode when prompted
+- Slow training:
+  - Start with fewer episodes and headless mode enabled
+- No checkpoints loaded:
+  - Verify algorithm-specific checkpoint name prefix (`dqn_`, `reinforce_`, `a2c_`)
+
+## Quick Start
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python main.py
 ```

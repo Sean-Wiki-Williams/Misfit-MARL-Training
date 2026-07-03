@@ -579,8 +579,8 @@ if __name__ == "__main__":
     env = knights_archers_zombies_v10.parallel_env(
         render_mode="human" if not headless else None,
         spawn_rate=1,
-        num_archers=1,
-        num_knights=0,
+        num_archers=2,
+        num_knights=2,
         max_zombies=1,
         max_arrows=2,
         max_cycles=2000

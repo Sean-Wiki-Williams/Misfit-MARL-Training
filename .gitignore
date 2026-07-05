@@ -9,6 +9,7 @@ checkpoints/
 .Python
 *.env
 *.png
+!docs/*.png
 *.npy
 *.log
 *.csv

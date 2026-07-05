@@ -66,6 +66,7 @@ class PPOPolicy:
         self.rewards = []
         self.dones = []
         self.values = []
+        self.last_entropy_mean = 0.0
 
     # -------------------------------------------------------------------------
     def _flatten_state(self, state):
@@ -76,20 +77,30 @@ class PPOPolicy:
         state_vec = self._flatten_state(state)
         state_tensor = torch.as_tensor(state_vec, device=self.device, dtype=torch.float32).unsqueeze(0)
 
-        logits = self.actor(state_tensor)
-        dist = torch.distributions.Categorical(logits=logits)
+        with torch.no_grad():
+            logits = self.actor(state_tensor)
+            dist = torch.distributions.Categorical(logits=logits)
 
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        value = self.critic(state_tensor)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+            value = self.critic(state_tensor)
 
         # Store rollout data
         self.states.append(state_vec)
         self.actions.append(int(action.item()))
-        self.log_probs.append(log_prob.detach())
+        self.log_probs.append(log_prob.squeeze(0).detach())
         self.values.append(value.item())
 
         return int(action.item())
+
+    # -------------------------------------------------------------------------
+    def get_state_value(self, state):
+        """Estimate V(s) for bootstrap when rollout ends mid-episode."""
+        state_vec = self._flatten_state(state)
+        state_tensor = torch.as_tensor(state_vec, device=self.device, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            value = self.critic(state_tensor)
+        return float(value.item())
 
     # -------------------------------------------------------------------------
     def remember_reward(self, reward, done):
@@ -97,13 +108,13 @@ class PPOPolicy:
         self.dones.append(done)
 
     # -------------------------------------------------------------------------
-    def _compute_gae(self):
+    def _compute_gae(self, bootstrap_value=0.0):
         rewards = np.array(self.rewards, dtype=np.float32)
         dones = np.array(self.dones, dtype=np.float32)
 
         # values: V(s_0), ..., V(s_{T-1})
-        # append V(s_T) = 0 for terminal episode
-        values = np.array(self.values + [0.0], dtype=np.float32)
+        # append V(s_T) from critic for rollout truncation, or 0 for terminal
+        values = np.array(self.values + [float(bootstrap_value)], dtype=np.float32)
 
         advantages = np.zeros_like(rewards)
         gae = 0.0
@@ -117,21 +128,22 @@ class PPOPolicy:
         return advantages, returns
 
     # -------------------------------------------------------------------------
-    def learn(self):
+    def learn(self, bootstrap_value=0.0):
         if len(self.states) == 0:
+            self.last_entropy_mean = 0.0
             return False, 0.0
 
         # Convert rollout to tensors
         states = torch.as_tensor(np.array(self.states), device=self.device, dtype=torch.float32)
         actions = torch.as_tensor(np.array(self.actions), device=self.device, dtype=torch.int64)
-        old_log_probs = torch.stack(self.log_probs).to(self.device)
+        old_log_probs = torch.stack(self.log_probs).to(self.device).view(-1)
 
-        advantages, returns = self._compute_gae()
+        advantages, returns = self._compute_gae(bootstrap_value=bootstrap_value)
         advantages = torch.as_tensor(advantages, device=self.device, dtype=torch.float32)
         returns = torch.as_tensor(returns, device=self.device, dtype=torch.float32)
 
         # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
         total_loss = 0.0
 
@@ -156,6 +168,7 @@ class PPOPolicy:
                 dist = torch.distributions.Categorical(logits=logits)
                 new_log_probs = dist.log_prob(batch_actions)
                 entropy = dist.entropy().mean()
+                self.last_entropy_mean = float(entropy.detach().item())
 
                 # Critic forward
                 values = self.critic(batch_states).squeeze(1)
@@ -175,13 +188,18 @@ class PPOPolicy:
                 loss = actor_loss + self.value_coef * critic_loss - self.entropy_coef * entropy
                 total_loss += loss.item()
 
-                # Backprop
+                # Backprop Actor
                 self.actor_opt.zero_grad()
-                self.critic_opt.zero_grad()
-                loss.backward()
+                actor_loss_total = actor_loss - self.entropy_coef * entropy
+                actor_loss_total.backward()
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
                 self.actor_opt.step()
+
+                # Backprop Critic
+                self.critic_opt.zero_grad()
+                critic_loss_total = self.value_coef * critic_loss
+                critic_loss_total.backward()
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
                 self.critic_opt.step()
 
         # Clear rollout

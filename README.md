@@ -6,6 +6,7 @@ Implemented learners:
 - DQN (value-based)
 - REINFORCE (policy gradient)
 - A2C (actor-critic)
+- PPO (clipped policy optimization)
 - Random baseline
 
 ## Environment
@@ -26,7 +27,7 @@ Implemented learners:
 - `DQN.py`: `DQN_Logic` implementation
 - `REINFORCE.py`: `ReinforcePolicy` implementation
 - `A2C.py`: `A2C_Logic` implementation
-- `PPO.py`: PPO policy class (currently not wired into `main.py` CLI)
+- `PPO.py`: `PPOPolicy` implementation
 - `requirements.txt`: project dependencies
 
 Generated during runs:
@@ -62,7 +63,7 @@ python main.py
 ```
 
 You will be prompted for:
-- Algorithm: `dqn`, `pg`, `a2c`, or `random`
+- Algorithm: `dqn`, `pg`, `a2c`, `ppo`, or `random`
 - Whether to load saved model weights from `checkpoints/`
 - Number of episodes
 - Headless mode
@@ -72,7 +73,7 @@ You will be prompted for:
 Example prompt flow:
 
 ```text
-Select algorithm [dqn/pg/a2c/random] (default dqn): dqn
+Select algorithm [dqn/pg/a2c/ppo/random] (default dqn): dqn
 Load saved model on start? [y/N]: n
 Enter number of episodes (default 3000): 1000
 Run headless? [Y/n]: y
@@ -86,6 +87,7 @@ Checkpoints are automatically saved at the end of training (including KeyboardIn
 - DQN: `checkpoints/dqn_<agent_name>.pt`
 - REINFORCE: `checkpoints/reinforce_<agent_name>.pt`
 - A2C: `checkpoints/a2c_<agent_name>.pt`
+- PPO: `checkpoints/ppo_<agent_name>.pt`
 
 If "Load saved model on start?" is enabled, matching checkpoint files are loaded per agent if found.
 
@@ -97,6 +99,7 @@ Log directories are created per run, for example:
 - `runs/DQN_MM_DD_HHMM`
 - `runs/REINFORCE_MM_DD_HHMM`
 - `runs/A2C_MM_DD_HHMM`
+- `runs/PPO_MM_DD_HHMM`
 - `runs/RANDOM_MM_DD_HHMM`
 
 If auto-open fails, open manually:
@@ -110,11 +113,11 @@ http://localhost:6006
 - `dqn`: trains independent DQN policies with replay memory and target networks
 - `pg`: trains independent REINFORCE policies
 - `a2c`: trains independent actor-critic policies with rollout updates
+- `ppo`: trains independent PPO policies with clipped objective and GAE
 - `random`: random-action baseline for comparison
 
 ## Notes and Limitations
 
-- `PPO.py` exists, but PPO is not currently selectable from the `main.py` CLI.
 - Training/log/checkpoint folders are ignored in git by default (`.gitignore`).
 
 ## Troubleshooting
@@ -126,7 +129,7 @@ http://localhost:6006
 - Slow training:
   - Start with fewer episodes and headless mode enabled
 - No checkpoints loaded:
-  - Verify algorithm-specific checkpoint name prefix (`dqn_`, `reinforce_`, `a2c_`)
+  - Verify algorithm-specific checkpoint name prefix (`dqn_`, `reinforce_`, `a2c_`, `ppo_`)
 
 ## Quick Start
 

@@ -18,7 +18,6 @@ import webbrowser
 import random
 import logging
 from pathlib import Path
-from VDN import VDN_Wrapper
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +99,7 @@ def _prompt_algorithm(default="dqn"):
     if not raw_value:
         return default
 
-    if raw_value in {"dqn", "pg", "a2c", "ppo", "vdn", "random"}:
+    if raw_value in {"dqn", "pg", "a2c", "ppo", "random"}:
         return raw_value
 
     print(f"Invalid value '{raw_value}'. Using default {default}.")
@@ -263,159 +262,6 @@ def run_DQN(num_episodes, verbose, env,  epsilon, epsilon_decay, epsilon_min, re
     finally:
         env.close()
 
-        _save_agent_checkpoints(agent_policies, "dqn")
-
-#***************************************************************************************************************#
-def run_VDN(num_episodes, verbose, env, epsilon, epsilon_decay, epsilon_min, render, load_saved_model):
-
-    t_board_writer = SummaryWriter(
-        log_dir="runs/VDN_" + datetime.now().strftime("%m_%d_%H%M"),
-        comment="Value Decomposition Network"
-    )
-
-    # Optional logging
-    if verbose:
-        print("Verbose logging enabled. Detailed information will be printed during training.")
-        log_path = Path(f"logs/VDN_" + datetime.now().strftime("%m_%d_%H%M") + ".log")
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        logging.basicConfig(
-            filename=log_path,
-            filemode='w',
-            level=logging.INFO,
-            format="%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
-        )
-
-    # -------------------------------------------------------------------------
-    # Initialize agents
-    observations, _ = env.reset()
-    agent_policies = {}
-
-    for agent, obs in observations.items():
-        state_size = obs.size
-        action_size = env.action_space(agent).n
-
-        agent_policies[agent] = DQN_Logic(
-            state_size=state_size,
-            action_space=action_size,
-            learning_rate=0.0001,
-            gamma=0.97,
-            epsilon=epsilon,
-            train_set_size=50000,
-            batch_size=64,
-            target_update_steps=2000,
-            hidden_layer_sizes=(128, 128),
-        )
-
-    print(f"Initialized DQN policies for agents:", list(agent_policies.keys()))
-
-    # Load saved model if requested
-    if load_saved_model:
-        _load_agent_checkpoints(agent_policies, "dqn")
-        epsilon = agent_policies[next(iter(agent_policies))].epsilon
-
-    # -------------------------------------------------------------------------
-    # Create VDN wrapper
-    vdn = VDN_Wrapper(agent_policies, gamma=0.97, batch_size=64, buffer_size=50000)
-
-    # -------------------------------------------------------------------------
-    try:
-        for episode in tqdm(range(1, num_episodes + 1)):
-
-            observations_before, _ = env.reset()
-            episode_rewards = {agent: 0.0 for agent in agent_policies}
-
-            step = 0
-            while True:
-                current_agents = list(observations_before.keys())
-                if len(current_agents) == 0:
-                    break
-
-                # -----------------------------
-                # ACTION SELECTION (VDN wrapper)
-                actions = vdn.get_actions(observations_before)
-
-                if verbose:
-                    logger.info("observations_before: %s", observations_before)
-                    logger.info("actions: %s", actions)
-
-                # -----------------------------
-                # ENV STEP
-                observations_after, rewards, terminations, truncations, infos = env.step(actions)
-
-                if verbose:
-                    logger.info("observations_after: %s", observations_after)
-                    logger.info("rewards: %s", rewards)
-
-                # -----------------------------
-                # TEAM REWARD
-                total_step_reward = sum(rewards.get(agent, 0.0) for agent in current_agents)
-
-                # TEAM DONE FLAG
-                done = all(
-                    terminations.get(a, False) or truncations.get(a, False)
-                    for a in current_agents
-                )
-
-                # -----------------------------
-                # STORE JOINT TRANSITION IN VDN MEMORY
-                vdn.remember(
-                    observations_before,
-                    actions,
-                    total_step_reward,
-                    observations_after,
-                    done
-                )
-
-                # Track per-agent reward (same for all agents in VDN)
-                for agent in current_agents:
-                    episode_rewards[agent] += float(total_step_reward)
-
-                # -----------------------------
-                # LEARNING STEP
-                if step % 2 == 0:
-                    trained, loss = vdn.learn()
-                    if verbose and trained:
-                        logger.info("VDN joint training step, loss: %s", loss)
-
-                # -----------------------------
-                # RENDER
-                step += 1
-                if render and step % 10 == 0:
-                    env.render()
-                    pygame.event.pump()
-                    time.sleep(0.02)
-
-                # -----------------------------
-                # ADVANCE STATE
-                observations_before = observations_after
-
-                if done:
-                    break
-
-            # -----------------------------------------------------------------
-            # EPSILON DECAY (shared across agents)
-            epsilon = max(epsilon_min, epsilon * epsilon_decay)
-            for agent in agent_policies.values():
-                agent.epsilon = epsilon
-
-            # -----------------------------------------------------------------
-            # LOGGING
-            for agent in agent_policies:
-                t_board_writer.add_scalar(f"reward/{agent}", episode_rewards[agent], episode)
-
-                for name, param in agent_policies[agent].target_model.named_parameters():
-                    t_board_writer.add_histogram(f"weights/{agent}/{name}", param.data.cpu(), episode)
-
-            t_board_writer.add_scalar("Total Reward", sum(episode_rewards.values()), episode)
-            t_board_writer.add_scalar("Epsilon", epsilon, episode)
-
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user. Saving progress...")
-
-    finally:
-        env.close()
         _save_agent_checkpoints(agent_policies, "dqn")
 
 #***************************************************************************************************************#
@@ -927,15 +773,4 @@ if __name__ == "__main__":
             num_episodes=num_episodes,
             env=env,
             render=not headless,
-        )
-    if selected_algorithm == "vdn":
-        run_VDN(
-            num_episodes=num_episodes,
-            verbose=verbose,
-            env=env,
-            epsilon=initial_epsilon,
-            epsilon_decay=0.9997,
-            epsilon_min=0.1,
-            render=not headless,
-            load_saved_model=load_saved_model,
         )

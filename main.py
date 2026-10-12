@@ -17,10 +17,10 @@ from torchrl.collectors import Collector
 import utils
 from tensordict.nn import TensorDictModule
 
-#frames_per_batch = 60_000  # 600 envs x 100 steps = one full episode per env per iteration
-#n_iters = 300  # Number of sampling and training iterations
-frames_per_batch = 6_000  # 600 envs x 100 steps = one full episode per env per iteration
-n_iters = 100  # Number of sampling and training iterations
+frames_per_batch = 60_000  # 600 envs x 100 steps = one full episode per env per iteration
+n_iters = 300  # Number of sampling and training iterations
+#frames_per_batch = 6_000  # 600 envs x 100 steps = one full episode per env per iteration
+#n_iters = 100  # Number of sampling and training iterations
 total_frames = frames_per_batch * n_iters
 
 # Training

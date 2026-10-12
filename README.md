@@ -6,9 +6,13 @@ Multi-agent reinforcement learning with **MAPPO** (multi-agent PPO) on a custom 
 
 Defined in `environment.py` (`TrainingScenario`):
 
-- Observation per agent: relative goal position, relative obstacle positions, lidar readings, position, velocity, rotation, angular velocity
-- Action per agent: continuous (speed, steering)
-- Reward per agent: progress toward its goal + a bonus of `5.0` when all agents reach their goals + a `-0.1` penalty for collisions with agents/obstacles
+- Fixed-wing-style aircraft (kinematic bicycle dynamics), no sensors, each with its own goal; positions are random each episode
+- Units: 1 world unit = 1 km, 1 s of sim time. The world is 80 km x 80 km (~50 mi across)
+- Each step is 5 s. Speed is limited to 0.08–0.15 km/s (~290–540 km/h): aircraft cannot stop or reverse. At full speed an aircraft covers ~0.75 km per step and ~75 km in a 100-step episode. Minimum turn radius is 2 km
+- Aircraft icons (0.5 km radius) and goals (1.5 km radius) are exaggerated so they are visible in renders; the goal radius is also the "reached" tolerance
+- Observation per agent (9 values, normalised to roughly -1..1): vector to its own goal (2), position (2), velocity (2), heading as cos and sin (2), angular velocity (1)
+- Action per agent: continuous (speed command, steering). The speed command is mapped onto the 0.08–0.15 km/s flight envelope
+- Reward per agent: progress toward its goal + a bonus of `5.0` when all agents reach their goals + a `-0.1` penalty for collisions with other agents
 - Episode ends when every agent is on its goal, or after 100 steps
 
 ## Algorithm

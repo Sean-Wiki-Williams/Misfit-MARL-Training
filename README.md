@@ -1,60 +1,67 @@
-# Multi-Agent Reinforcement Learning for Knights, Archers, Zombies
+# Misfit MARL Training
 
-This project trains multiple agents in PettingZoo's Knights, Archers, Zombies environment using independent learners per agent.
+Multi-agent reinforcement learning with **MAPPO** (multi-agent PPO) on a custom [VMAS](https://github.com/proroklab/VectorizedMultiAgentSimulator) scenario. Training is built on [TorchRL](https://github.com/pytorch/rl) and runs many environments in parallel on the GPU.
 
-Implemented learners:
-- DQN (value-based)
-- REINFORCE (policy gradient)
-- A2C (actor-critic)
-- PPO (clipped policy optimization)
-- Random baseline
+## Scenario
 
-## Environment
+Defined in `environment.py` (`TrainingScenario`):
 
-- Environment: `pettingzoo.butterfly.knights_archers_zombies_v10`
-- API mode: parallel environment
-- Default environment settings in `main.py`:
-  - `num_archers=2`
-  - `num_knights=2`
-  - `spawn_rate=1`
-  - `max_zombies=1`
-  - `max_arrows=2`
-  - `max_cycles=2000`
+- Observation per agent: relative goal position, relative obstacle positions, lidar readings, position, velocity, rotation, angular velocity
+- Action per agent: continuous (speed, steering)
+- Reward per agent: progress toward its goal + a bonus of `5.0` when all agents reach their goals + a `-0.1` penalty for collisions with agents/obstacles
+- Episode ends when every agent is on its goal, or after 100 steps
+
+## Algorithm
+
+- `mappo_policy.py`: decentralised actor. A shared-parameter MLP (2 x 256, Tanh) maps each agent's own observation to a `TanhNormal` action distribution.
+- `mappo_critic.py`: centralised critic. A shared-parameter MLP (2 x 256, Tanh) that sees all agents' observations and outputs one value per agent.
+- `main.py`: training loop using `ClipPPOLoss` with GAE (`gamma=0.99`, `lmbda=0.9`, `clip_epsilon=0.2`), Adam (`lr=5e-5`) and gradient clipping.
+
+Key hyperparameters are at the top of `main.py`:
+
+| Setting | Default |
+|---|---|
+| Parallel environments | 600 |
+| `frames_per_batch` | 6,000 |
+| `n_iters` | 100 |
+| `num_epochs` per iteration | 10 |
+| `minibatch_size` | 2,000 |
 
 ## Repository Structure
 
-- `main.py`: training entrypoint, CLI prompts, TensorBoard launcher, training loops
-- `DQN.py`: `DQN_Logic` implementation
-- `REINFORCE.py`: `ReinforcePolicy` implementation
-- `A2C.py`: `A2C_Logic` implementation
-- `PPO.py`: `PPOPolicy` implementation
-- `requirements.txt`: project dependencies
+- `main.py`: training entrypoint
+- `environment.py`: VMAS scenario
+- `mappo_policy.py`: actor network
+- `mappo_critic.py`: critic network
+- `requirements.txt`: dependencies
 
-Generated during runs:
-- `runs/`: TensorBoard event files
-- `logs/`: verbose run logs (when enabled)
-- `checkpoints/`: saved model checkpoints (`*.pt`)
+Generated during runs (git-ignored):
+
+- `runs/`: TensorBoard logs
+- `checkpoints/`: saved models (`checkpoint_<step>.pt`)
 
 ## Setup
 
-### 1) Create and activate a virtual environment
-
-PowerShell:
-
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-### 2) Install dependencies
-
-```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-Notes:
-- On Windows, `requirements.txt` pulls the CUDA 12.1 PyTorch wheel.
-- If you do not have a CUDA-compatible GPU/driver, install CPU PyTorch manually first, then install the rest.
+`requirements.txt` installs the CUDA 12.8 build of PyTorch. Verify the GPU is visible:
+
+```powershell
+python -c "import torch; print(torch.cuda.is_available())"
+```
+
+If this prints `False` and the version contains `+cpu`, a CPU-only PyTorch is installed. Reinstall with:
+
+```powershell
+pip uninstall -y torch
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+```
+
+The script falls back to the CPU if CUDA is unavailable, but 600 parallel environments will be slow.
 
 ## Run Training
 
@@ -62,80 +69,26 @@ Notes:
 python main.py
 ```
 
-You will be prompted for:
-- Algorithm: `dqn`, `pg`, `a2c`, `ppo`, or `random`
-- Whether to load saved model weights from `checkpoints/`
-- Number of episodes
-- Headless mode
-- Verbose logging
-- Initial epsilon (DQN only)
-
-Example prompt flow:
-
-```text
-Select algorithm [dqn/pg/a2c/ppo/random] (default dqn): dqn
-Load saved model on start? [y/N]: n
-Enter number of episodes (default 3000): 1000
-Run headless? [Y/n]: y
-Enable verbose logging? [y/N]: n
-Set initial epsilon for DQN (default 1.0): 1.0
-```
-
 ## Checkpoints
 
-Checkpoints are automatically saved at the end of training (including KeyboardInterrupt handling):
-- DQN: `checkpoints/dqn_<agent_name>.pt`
-- REINFORCE: `checkpoints/reinforce_<agent_name>.pt`
-- A2C: `checkpoints/a2c_<agent_name>.pt`
-- PPO: `checkpoints/ppo_<agent_name>.pt`
-
-If "Load saved model on start?" is enabled, matching checkpoint files are loaded per agent if found.
+Every 100 iterations (`checkpoint_interval`), `main.py` saves `checkpoints/checkpoint_<step>.pt` containing the actor and critic weights, optimizer state and step number.
 
 ## TensorBoard
 
-`main.py` starts TensorBoard automatically on port `6006` and attempts to open a browser tab.
+Logs go to `runs/mappo_<timestamp>`. The program does not launch TensorBoard; start it in a second terminal:
 
-Log directories are created per run, for example:
-- `runs/DQN_MM_DD_HHMM`
-- `runs/REINFORCE_MM_DD_HHMM`
-- `runs/A2C_MM_DD_HHMM`
-- `runs/PPO_MM_DD_HHMM`
-- `runs/RANDOM_MM_DD_HHMM`
-
-If auto-open fails, open manually:
-
-```text
-http://localhost:6006
+```powershell
+python -m tensorboard.main --logdir runs
 ```
 
-## Current CLI Algorithms
+Then open http://localhost:6006. Logged data:
 
-- `dqn`: trains independent DQN policies with replay memory and target networks
-- `pg`: trains independent REINFORCE policies
-- `a2c`: trains independent actor-critic policies with rollout updates
-- `ppo`: trains independent PPO policies with clipped objective and GAE
-- `random`: random-action baseline for comparison
-
-## Notes and Limitations
-
-- Training/log/checkpoint folders are ignored in git by default (`.gitignore`).
+- **Scalars**: losses (total, objective, critic, entropy), rewards (step mean, running return, episode return, reward components), completed episodes, mean action scale, frames processed
+- **Histograms**: actor and critic weights, every `histogram_interval` (5) iterations
+- **Images**: after training, a rollout from a fresh random environment is rendered and logged as a looping GIF (`render/final_rollout`). The GIF is also saved as `final_rollout.gif` in the run's log folder.
 
 ## Troubleshooting
 
-- TensorBoard command not found:
-  - Install it in your active venv: `pip install tensorboard`
-- No render window appears:
-  - Disable headless mode when prompted
-- Slow training:
-  - Start with fewer episodes and headless mode enabled
-- No checkpoints loaded:
-  - Verify algorithm-specific checkpoint name prefix (`dqn_`, `reinforce_`, `a2c_`, `ppo_`)
-
-## Quick Start
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python main.py
-```
+- `AssertionError: Torch not compiled with CUDA enabled`: CPU-only PyTorch is installed; see Setup.
+- The progress bar sits at the last iteration for a while: the final rollout is being rendered.
+- `add_video` fails on Windows (`moviepy` temp-file permission error): that is why the GIF is written to the event file directly.

@@ -1,4 +1,3 @@
-
 import torch
 from torchrl.modules import MultiAgentMLP, ProbabilisticActor, TanhNormal
 from tensordict.nn import TensorDictModule

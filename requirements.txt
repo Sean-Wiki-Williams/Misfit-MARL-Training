@@ -1,12 +1,12 @@
-# Use CUDA 12.1 PyTorch wheel on Windows (requires compatible NVIDIA driver/GPU).
---extra-index-url https://download.pytorch.org/whl/cu121
-torch==2.5.1+cu121 ; platform_system == "Windows"
-torch==2.5.1 ; platform_system != "Windows"
+# CUDA 12.8 PyTorch wheel (requires compatible NVIDIA driver/GPU).
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
 
-matplotlib
+torchrl
+tensordict
+vmas
 numpy
-pettingzoo
-gymnasium
-pygame>=2.5.2
+pillow
+pyglet
 tensorboard
 tqdm

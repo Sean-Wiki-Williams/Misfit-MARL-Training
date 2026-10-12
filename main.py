@@ -1,5 +1,3 @@
-from email import policy
-
 from environment import TrainingScenario
 from torchrl.envs.libs.vmas import VmasEnv
 from torchrl.envs.utils import MarlGroupMapType
@@ -16,8 +14,8 @@ from tensorboard.compat.proto.summary_pb2 import Summary
 from datetime import datetime
 from tqdm import tqdm
 from torchrl.collectors import Collector
-# from PIL import Image
-# from IPython.display import Image as IPyImage
+import utils
+from tensordict.nn import TensorDictModule
 
 #frames_per_batch = 60_000  # 600 envs x 100 steps = one full episode per env per iteration
 #n_iters = 300  # Number of sampling and training iterations
@@ -238,6 +236,21 @@ for iteration, tensordict_data in enumerate(collector, start=1):
 
     pbar.update()
 
+# Save a deterministic TorchScript version of the actor. Torchscript cannot compile TorchRL's ProbabilisticActor, so we use the utility function to build a deterministic version.
+os.makedirs("models/actor", exist_ok=True)
+with torch.no_grad():
+    scripted = torch.jit.script(utils.build_deterministic_actor(mappo_policy))
+    scripted.save("models/actor/mappo_actor_scripted.pt")
+
+print("\nSaved TorchScript actor to models/actor/mappo_actor_scripted.pt")
+print("Input: observations (batch, n_agents, obs_dim) -> output: actions (batch, n_agents, action_dim)")
+
+# Load the deterministic TorchScript actor
+scripted_actor = TensorDictModule(
+    utils.load_actor("models/actor/mappo_actor_scripted.pt").to(env.device),
+    in_keys=[("agents", "observation")],
+    out_keys=[env.action_key],
+)
 
 # Render one rollout from a freshly reset (random) environment and log it to TensorBoard
 def rendering_callback(env, td):
@@ -247,7 +260,7 @@ env.frames = []
 with torch.no_grad():
     env.rollout(
         max_steps=100,
-        policy=mappo_policy.policy,
+        policy=scripted_actor,
         callback=rendering_callback,
         auto_cast_to_device=True,
         break_when_any_done=False,
@@ -280,65 +293,4 @@ writer.flush()
 
 
 
-## Policy Network and Actor Setup-------------------------------------------------------------------------------------------------
-
-
-
-# import os
-# import time
-# from datetime import datetime
-# import matplotlib.pyplot as plt
-# import numpy as np
-# import torch
-# import pygame
-# from pettingzoo.butterfly import knights_archers_zombies_v10
-# from DQN import DQN_Logic
-# from REINFORCE import ReinforcePolicy
-# from A2C import A2C_Logic
-# from PPO import PPOPolicy
-# from torch.utils.tensorboard import SummaryWriter
-# from tqdm import tqdm
-# import subprocess
-# import os
-# import webbrowser
-# import random
-# import logging
-# from pathlib import Path
-
-# logger = logging.getLogger(__name__)
-
-# #***************************************************************************************************************#
-# def launch_tensorboard(logdir="runs"):
-#     # Ensure the log directory exists
-
-#     os.makedirs(logdir, exist_ok=True)
-
-#     # Launch TensorBoard as a background process
-#     tb = subprocess.Popen(
-#         ["tensorboard", f"--logdir={logdir}", "--bind_all", "--port=6006"],
-#         stdout=subprocess.PIPE,
-#         stderr=subprocess.PIPE
-#     )
-
-#     # Optional: auto-open browser
-#     webbrowser.open("http://localhost:6006")
-
-#     return tb
-
-
-# #***************************************************************************************************************#
-# def run_PPO(num_episodes=100, verbose=True, env=None, render=True, load_saved_model=False):
-
-#   
-
-
-#             t_board_writer.add_scalar("Total Reward", sum(episode_rewards.values()), episode)
-
-#     except KeyboardInterrupt:
-#         print("\nTraining interrupted by user. Saving progress...")
-
-#     finally:
-#         env.close()
-
-#         _save_agent_checkpoints(agent_policies, "ppo")
 

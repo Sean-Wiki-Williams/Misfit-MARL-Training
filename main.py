@@ -1,776 +1,344 @@
-import os
-import time
-from datetime import datetime
-import matplotlib.pyplot as plt
-import numpy as np
+from email import policy
+
+from environment import TrainingScenario
+from torchrl.envs.libs.vmas import VmasEnv
+from torchrl.envs.utils import MarlGroupMapType
 import torch
-import pygame
-from pettingzoo.butterfly import knights_archers_zombies_v10
-from DQN import DQN_Logic
-from REINFORCE import ReinforcePolicy
-from A2C import A2C_Logic
-from PPO import PPOPolicy
+from mappo_policy import mappo_policy
+from mappo_critic import mappo_critic
+from torchrl.envs import RewardSum, TransformedEnv
+from torchrl.objectives import ClipPPOLoss, ValueEstimators
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
-import subprocess
 import os
-import webbrowser
-import random
-import logging
-from pathlib import Path
+import numpy as np
+from PIL import Image
+from tensorboard.compat.proto.summary_pb2 import Summary
+from datetime import datetime
+from tqdm import tqdm
+from torchrl.collectors import Collector
+# from PIL import Image
+# from IPython.display import Image as IPyImage
 
-logger = logging.getLogger(__name__)
+#frames_per_batch = 60_000  # 600 envs x 100 steps = one full episode per env per iteration
+#n_iters = 300  # Number of sampling and training iterations
+frames_per_batch = 6_000  # 600 envs x 100 steps = one full episode per env per iteration
+n_iters = 100  # Number of sampling and training iterations
+total_frames = frames_per_batch * n_iters
 
-#***************************************************************************************************************#
-def launch_tensorboard(logdir="runs"):
-    # Ensure the log directory exists
-    os.makedirs(logdir, exist_ok=True)
+# Training
+num_epochs = 10  # Number of optimization steps per training iteration
+minibatch_size = 2000  # Size of the mini-batches in each optimization step
+lr = 5e-5  # Learning rate
+max_grad_norm = 1.0  # Maximum norm for the gradients
 
-    # Launch TensorBoard as a background process
-    tb = subprocess.Popen(
-        ["tensorboard", f"--logdir={logdir}", "--bind_all", "--port=6006"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
+# PPO
+clip_epsilon = 0.2  # clip value for PPO loss
+gamma = 0.99  # discount factor
+lmbda = 0.9  # lambda for generalised advantage estimation
+entropy_eps = 1e-4  # coefficient of the entropy term in the PPO loss
+
+# Creating and testing environment
+env = VmasEnv(
+    scenario=TrainingScenario(),
+    num_envs= 600,
+    continuous_actions=True,
+    max_steps=100,
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    group_map=MarlGroupMapType.ALL_IN_ONE_GROUP,
+)
+
+# Wrapping environment with reward transformation
+env = TransformedEnv(
+    env,
+    RewardSum(in_keys=[env.reward_key], out_keys=[("agents", "episode_reward")]),
+)
+
+mappo_policy = mappo_policy(env) 
+mappo_critic = mappo_critic(env) 
+
+print("Tensorboard is active, to view results input this command in a terminal:")
+print(".\\venv\\Scripts\\python.exe -m tensorboard.main --logdir runs")
+
+# A collector is typically for on-policy algorithms
+collector = Collector(
+    env, # Environment wrapped in a transform
+    mappo_policy.policy, # Reads agent observations and outputs actions
+    device=env.device, 
+    storing_device=env.device,
+    frames_per_batch=frames_per_batch,
+    total_frames=total_frames,
+    auto_register_policy_transforms=True, # Important: Automatically register any policy transforms with the collector
+)
+
+# Determining our Loss function using a MAPPO loss module with clipping and GAE
+
+loss_module = ClipPPOLoss( ## PPO with clipping
+    actor_network=mappo_policy.policy, 
+    critic_network=mappo_critic.policy,
+    clip_epsilon=clip_epsilon,
+    entropy_coeff=entropy_eps,
+    normalize_advantage=False,  # Important to avoid normalizing, you destroy agent-specific rewards
+)
+loss_module.set_keys(  # Telling the loss where to find the keys
+    reward=env.reward_key,
+    action=env.action_key,
+    value=("agents", "state_value"),
+    done=("agents", "done"),
+    terminated=("agents", "terminated"),
+)
+
+# Attaches a Generalized Advantage Estimation (GAE)
+loss_module.make_value_estimator(
+    ValueEstimators.GAE, gamma=gamma, lmbda=lmbda
+)
+GAE = loss_module.value_estimator
+
+# Optimizer for the loss module
+optim = torch.optim.Adam(loss_module.parameters(), lr)
+
+#Training summary writer for TensorBoard
+writer = SummaryWriter(log_dir=os.path.join("runs", datetime.now().strftime("mappo_%Y%m%d_%H%M%S")))
+writer.add_text(
+    "hparams",
+    f"frames_per_batch={frames_per_batch}, n_iters={n_iters}, num_epochs={num_epochs}, "
+    f"minibatch_size={minibatch_size}, lr={lr}, clip_epsilon={clip_epsilon}, gamma={gamma}, lmbda={lmbda}",
+)
+
+checkpoint_interval = 100
+histogram_interval = 5  # Log weight histograms every N iterations
+checkpoint_path = "checkpoints"
+os.makedirs(checkpoint_path, exist_ok=True)
+
+global_step = 0
+pbar = tqdm(total=n_iters)
+
+episode_reward_mean_list = []
+episode_reward_iteration_list = []
+total_loss_history = []
+objective_loss_history = []
+critic_loss_history = []
+entropy_loss_history = []
+loss_iteration_history = []
+step_reward_mean_history = []
+running_return_history = []
+
+for iteration, tensordict_data in enumerate(collector, start=1):
+
+    # Expand the done and terminated flags to match the reward shape for each agent
+    tensordict_data.set(
+        ("next", "agents", "done"),
+        tensordict_data.get(("next", "done"))
+        .unsqueeze(-1)
+        .expand(tensordict_data.get_item_shape(("next", env.reward_key))),
     )
 
-    # Optional: auto-open browser
-    webbrowser.open("http://localhost:6006")
-
-    return tb
-
-#***************************************************************************************************************#
-def _prompt_int(prompt_text, default=200):
-    """Prompts for an integer value and returns a validated result."""
-    raw_value = input(f"\n{prompt_text} (default {default}): ").strip()
-    if not raw_value:
-        return default
-
-    try:
-        value = int(raw_value)
-    except ValueError:
-        print(f"Invalid value '{raw_value}'. Using default {default}.")
-        return default
-
-    return value
-
-
-#***************************************************************************************************************#
-def _prompt_float(prompt_text, default=1.0, min_value=None, max_value=None):
-    """Prompts for a float value and returns a validated result."""
-    raw_value = input(f"\n{prompt_text} (default {default}): ").strip()
-    if not raw_value:
-        return default
-
-    try:
-        value = float(raw_value)
-    except ValueError:
-        print(f"Invalid value '{raw_value}'. Using default {default}.")
-        return default
-
-    if min_value is not None and value < min_value:
-        print(f"Value must be >= {min_value}. Using default {default}.")
-        return default
-
-    if max_value is not None and value > max_value:
-        print(f"Value must be <= {max_value}. Using default {default}.")
-        return default
-
-    return value
-
-
-#***************************************************************************************************************#
-def _prompt_yes_no(prompt_text, default=False):
-    """Prompts for a yes/no response and returns a validated boolean result."""
-    default_label = "Y/n" if default else "y/N"
-    while True:
-        response = input(f"\n{prompt_text} [{default_label}]: ").strip().lower()
-        if response == "":
-            return default
-        if response in ("y", "yes"):
-            return True
-        if response in ("n", "no"):
-            return False
-        print("Invalid selection. Enter y or n.")
-
-
-#***************************************************************************************************************#
-def _prompt_algorithm(default="dqn"):
-    raw_value = input("\nSelect algorithm [dqn/pg/a2c/ppo/vdn/vdrandom] (default dqn): ").strip().lower()
-    if not raw_value:
-        return default
-
-    if raw_value in {"dqn", "pg", "a2c", "ppo", "random"}:
-        return raw_value
-
-    print(f"Invalid value '{raw_value}'. Using default {default}.")
-    return default
-
-
-#***************************************************************************************************************#
-def _checkpoint_dir():
-    """Returns the directory path for saving/loading model checkpoints."""
-
-    return os.path.join(os.path.dirname(__file__), "checkpoints")
-
-
-#***************************************************************************************************************#
-def _checkpoint_path(algorithm, agent_name):
-    """Returns the file path for a specific agent's checkpoint."""
-
-    return os.path.join(_checkpoint_dir(), f"{algorithm.lower()}_{agent_name}.pt")
-
-
-#***************************************************************************************************************#
-def _load_agent_checkpoints(agent_policies, algorithm):
-    """Loads the checkpoints for all agents."""
-    loaded_agents = []
-    missing_agents = []
-
-    for agent_name, policy in agent_policies.items():
-        checkpoint_path = _checkpoint_path(algorithm, agent_name)
-        if os.path.exists(checkpoint_path):
-            policy.load(checkpoint_path)
-            loaded_agents.append(agent_name)
-        else:
-            missing_agents.append(agent_name)
-
-    if loaded_agents:
-        print(f"Loaded saved {algorithm.upper()} model(s) for agents: {loaded_agents}")
-    if missing_agents:
-        print(f"No saved {algorithm.upper()} checkpoint found for agents: {missing_agents}")
-
-
-#***************************************************************************************************************#
-def _save_agent_checkpoints(agent_policies, algorithm):
-    """Saves the checkpoints for all agents."""
-
-    os.makedirs(_checkpoint_dir(), exist_ok=True)
-
-    for agent_name, policy in agent_policies.items():
-        checkpoint_path = _checkpoint_path(algorithm, agent_name)
-        policy.save(checkpoint_path)
-
-    print(f"Saved {algorithm.upper()} model checkpoints to {_checkpoint_dir()}")
-
-#***************************************************************************************************************#
-def run_DQN(num_episodes, verbose, env,  epsilon, epsilon_decay, epsilon_min, render, load_saved_model):
-
-    t_board_writer = SummaryWriter(log_dir="runs/DQN_" + datetime.now().strftime("%m_%d_%H%M"), comment="Deep Q-Network")
-
-    if verbose:
-        print("Verbose logging enabled. Detailed information will be printed during training.")
-        log_path = Path(f"logs/DQN_" + datetime.now().strftime("%m_%d_%H%M") + ".log")
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        logging.basicConfig(
-            filename=log_path,
-            filemode='w',
-            level=logging.INFO,
-            format="%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
-        )
-
-    observations, _ = env.reset()
-
-    agent_policies = {}
-    for agent, obs in observations.items():
-        state_size = obs.size
-        action_size = env.action_space(agent).n
-
-        agent_policies[agent] = DQN_Logic(
-            state_size=state_size,
-            action_space=action_size,
-            learning_rate=0.0001,
-            gamma=0.97,
-            epsilon=epsilon,
-            train_set_size=50000,
-            batch_size=64,
-            target_update_steps=2000,
-            hidden_layer_sizes=(128, 128),
-        )
-    
-    print(f"Initialized DQN policies for agents:", list(agent_policies.keys()))
-
-    if load_saved_model:
-        _load_agent_checkpoints(agent_policies, "dqn")
-        epsilon = agent_policies[next(iter(agent_policies))].epsilon
-   
-    try:
-        for episode in tqdm(range(1, num_episodes + 1)):
-            observations_before, _ = env.reset()
-            episode_rewards = {agent: 0.0 for agent in agent_policies}
-            
-            step = 0
-            while True:
-                current_agents = list(observations_before.keys())
-                if len(current_agents) == 0:
-                    break
-
-                actions = {}
-
-                for agent in current_agents:
-                    actions[agent] = agent_policies[agent].get_action(observations_before[agent])
-                if verbose:
-                    logger.info("observations_before: %s", observations_before)
-                    logger.info("actions: %s", actions)
-                observations_after, rewards, terminations, truncations, infos = env.step(actions)
-                if verbose:
-                    logger.info("observations_after: %s", observations_after)
-                    logger.info("rewards: %s", rewards)
-                for agent in current_agents:
-                    action = actions[agent]
-                    reward = rewards.get(agent, 0.0)
-                    done = terminations.get(agent, False) or truncations.get(agent, False)
-                    observation_after = observations_after.get(agent, observations_before[agent])
-                    observation_before = observations_before[agent]
-                    agent_policies[agent].remember(observation_before, action, reward, observation_after, done) 
-                    episode_rewards[agent] += float(reward)
-
-                if step % 2 == 0:
-                    for agent in current_agents:
-                        trained, loss = agent_policies[agent].learn()
-                        if verbose and trained:
-                            logger.info("Agent %s trained with loss: %s", agent, loss)
-                    
-                step += 1
-                if render and step % 10 == 0:
-                    env.render()
-                    pygame.event.pump()
-                    time.sleep(0.02)
-
-                observations_before = observations_after
-
-                if all(terminations.get(a, False) or truncations.get(a, False) for a in current_agents):
-                    break
-
-            epsilon = max(epsilon_min, epsilon * epsilon_decay)
-            for agent in agent_policies.values():
-                agent.epsilon = epsilon
-
-            for agent in agent_policies:
-                t_board_writer.add_scalar(f"reward/{agent}", episode_rewards[agent], episode)
-                
-                for name, param in agent_policies[agent].target_model.named_parameters():
-                    t_board_writer.add_histogram(f"weights/{agent}/{name}", param.data.cpu(), episode)
-            
-            t_board_writer.add_scalar("Total Reward", sum(episode_rewards.values()), episode)
-            t_board_writer.add_scalar("Epsilon", epsilon, episode)
-            
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user. Saving progress...")
-    
-    finally:
-        env.close()
-
-        _save_agent_checkpoints(agent_policies, "dqn")
-
-#***************************************************************************************************************#
-def run_REINFORCE(num_episodes=100, verbose = True, env = None, render=True, load_saved_model=False):
-    
-    learning_rate = 3e-4
-    gamma = 0.99
-    entropy_coef = 0.01
-
-    t_board_writer = SummaryWriter(log_dir="runs/REINFORCE_" + datetime.now().strftime("%m_%d_%H%M"), comment="Policy Gradient with REINFORCE")
-
-    if verbose:
-        print("Verbose logging enabled. Detailed information will be printed during training.")
-        log_path = Path(f"logs/REINFORCE_" + datetime.now().strftime("%m_%d_%H%M") + ".log")
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        logging.basicConfig(
-            filename=log_path,
-            filemode='w',
-            level=logging.INFO,
-            format="%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
-        )
-    
-    observations_before, _ = env.reset()
-    agent_policies = {}
-    for agent, obs in observations_before.items():
-        state_size = obs.size
-        action_size = env.action_space(agent).n
-        
-        agent_policies[agent] = ReinforcePolicy(
-            state_size=state_size,
-            action_space=action_size,
-            learning_rate=learning_rate,
-            gamma=gamma,
-            entropy_coef=entropy_coef,
-            hidden_layer_sizes=(128, 128),
-        )
-
-    sample_agent = next(iter(agent_policies.values()))
-    sample_state = torch.zeros(1, sample_agent.state_size).to(sample_agent.device)
-    t_board_writer.add_graph(sample_agent.policy, sample_state)
-
-    print(f"Initialized REINFORCE policies for agents:", list(agent_policies.keys()))
-
-    if load_saved_model:
-        _load_agent_checkpoints(agent_policies, "reinforce")
-
-    try:
-        for episode in tqdm(range(1, num_episodes + 1)):
-            observations_before, _ = env.reset()
-            episode_rewards = {agent: 0.0 for agent in agent_policies}
-            step = 0
-            while True:
-                if verbose:
-                    logger.info("observations_before: %s", observations_before)
-                current_agents = list(observations_before.keys())
-                if len(current_agents) == 0:
-                    break
-
-                actions = {}
-
-                for agent in current_agents:
-                    action, log_prob, entropy = agent_policies[agent].get_action(observations_before[agent])
-                    actions[agent] = action
-                    agent_policies[agent].remember(0.0, log_prob, entropy)
-                if verbose:
-                    logger.info("actions: %s", actions)
-                observations_after, rewards, terminations, truncations, _ = env.step(actions)
-                if verbose:
-                    logger.info("observations_after: %s", observations_after)
-                    logger.info("rewards: %s", rewards)
-                for agent in current_agents:
-                    reward = rewards.get(agent, 0.0)
-                    done = terminations.get(agent, False) or truncations.get(agent, False)
-                    if agent_policies[agent].rewards:
-                        # Update the reward for the most recent sampled action.
-                        agent_policies[agent].rewards[-1] = torch.tensor(
-                            reward, dtype=torch.float32, device=agent_policies[agent].device
-                        )
-                    if verbose:
-                        logger.info("Agent %s received reward: %s", agent, reward)
-                    episode_rewards[agent] += float(reward)
-
-                step += 1
-                if render and step % 10 == 0:
-                    env.render()
-                    pygame.event.pump()
-                    time.sleep(0.02)
-
-                observations_before = observations_after
-                if verbose:
-                    logger.info("observations_before: %s", observations_before)
-
-                if all(terminations.get(a, False) or truncations.get(a, False) for a in env.agents):
-                    break
-
-            for agent in agent_policies:
-                t_board_writer.add_scalar(f"reward/{agent}", episode_rewards[agent], episode)
-                trained, loss, entropy_bonus = agent_policies[agent].learn()
-                if trained:
-                    t_board_writer.add_scalar(f"Entropy Bonus/{agent}", entropy_bonus, episode)
-                    for name, param in agent_policies[agent].policy.named_parameters():
-                        t_board_writer.add_histogram(f"weights/{agent}/{name}", param.data.cpu(), episode)
-            
-            t_board_writer.add_scalar("Total Reward", sum(episode_rewards.values()), episode)
-    
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user. Saving progress...")
-    
-    finally:
-        env.close()
-
-        _save_agent_checkpoints(agent_policies, "reinforce")
-
-#***************************************************************************************************************#
-def run_PPO(num_episodes=100, verbose=True, env=None, render=True, load_saved_model=False):
-
-    learning_rate = 3e-4
-    gamma = 0.99
-    lam = 0.95
-    clip_eps = 0.2
-    entropy_coef = 0.01
-    value_coef = 0.5
-    batch_size = 256
-    update_epochs = 4
-    rollout_length = 512
-
-    t_board_writer = SummaryWriter(
-        log_dir="runs/PPO_" + datetime.now().strftime("%m_%d_%H%M"),
-        comment="Proximal Policy Optimization"
+    tensordict_data.set(
+        ("next", "agents", "terminated"),
+        tensordict_data.get(("next", "terminated"))
+        .unsqueeze(-1)
+        .expand(tensordict_data.get_item_shape(("next", env.reward_key))),
     )
 
-    if verbose:
-        print("Verbose logging enabled. Detailed information will be printed during training.")
-        log_path = Path(f"logs/PPO_" + datetime.now().strftime("%m_%d_%H%M") + ".log")
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        logging.basicConfig(
-            filename=log_path,
-            filemode='w',
-            level=logging.INFO,
-            format="%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
+    # Compute GAE for the current rollout
+    with torch.no_grad():
+        GAE(
+            tensordict_data,
+            params=loss_module.critic_network_params,
+            target_params=loss_module.target_critic_network_params,
         )
 
-    observations_before, _ = env.reset()
-    agent_policies = {}
-    for agent, obs in observations_before.items():
-        state_size = obs.size
-        action_size = env.action_space(agent).n
-        agent_policies[agent] = PPOPolicy(
-            state_size=state_size,
-            action_space=action_size,
-            learning_rate=learning_rate,
-            gamma=gamma,
-            lam=lam,
-            clip_eps=clip_eps,
-            entropy_coef=entropy_coef,
-            value_coef=value_coef,
-            batch_size=batch_size,
-            update_epochs=update_epochs,
-            hidden_layer_sizes=(128, 128),
-        )
+    # Flatten the current rollout so each PPO epoch can shuffle it independently.
+    data_view = tensordict_data.reshape(-1)
 
-    print(f"Initialized PPO policies for agents:", list(agent_policies.keys()))
+    iter_losses = {"total": [], "objective": [], "critic": [], "entropy": []}
 
-    if load_saved_model:
-        _load_agent_checkpoints(agent_policies, "ppo")
+    for _ in range(num_epochs):
+        permutation = torch.randperm(data_view.shape[0], device=data_view.device)
+        for start in range(0, data_view.shape[0], minibatch_size):
+            indices = permutation[start : start + minibatch_size]
+            subdata = data_view[indices]
+            loss_vals = loss_module(subdata)
 
-    try:
-        for episode in tqdm(range(1, num_episodes + 1)):
-            observations_before, _ = env.reset()
-            episode_rewards = {agent: 0.0 for agent in agent_policies}
-            episode_losses = {agent: [] for agent in agent_policies}
-
-            step = 0
-            while True:
-                if verbose:
-                    logger.info("observations_before: %s", observations_before)
-
-                current_agents = list(observations_before.keys())
-                if len(current_agents) == 0:
-                    break
-
-                actions = {}
-                for agent in current_agents:
-                    actions[agent] = agent_policies[agent].get_action(observations_before[agent])
-
-                if verbose:
-                    logger.info("actions: %s", actions)
-
-                observations_after, rewards, terminations, truncations, _ = env.step(actions)
-
-                if verbose:
-                    logger.info("observations_after: %s", observations_after)
-                    logger.info("rewards: %s", rewards)
-
-                for agent in current_agents:
-                    reward = rewards.get(agent, 0.0)
-                    done = terminations.get(agent, False) or truncations.get(agent, False)
-                    agent_policies[agent].remember_reward(reward, done)
-                    episode_rewards[agent] += float(reward)
-
-                    if verbose:
-                        logger.info("Agent %s received reward: %s", agent, reward)
-
-                for agent in current_agents:
-                    if len(agent_policies[agent].states) >= rollout_length:
-                        done = terminations.get(agent, False) or truncations.get(agent, False)
-                        if done:
-                            bootstrap_value = 0.0
-                        else:
-                            next_obs = observations_after.get(agent)
-                            bootstrap_value = 0.0 if next_obs is None else agent_policies[agent].get_state_value(next_obs)
-
-                        trained, loss = agent_policies[agent].learn(bootstrap_value=bootstrap_value)
-                        if trained:
-                            episode_losses[agent].append(loss)
-
-                step += 1
-                if render and step % 10 == 0:
-                    env.render()
-                    pygame.event.pump()
-                    time.sleep(0.02)
-
-                observations_before = observations_after
-
-                if all(terminations.get(a, False) or truncations.get(a, False) for a in current_agents):
-                    break
-
-            for agent in agent_policies:
-                if len(agent_policies[agent].states) > 0:
-                    trained, loss = agent_policies[agent].learn(bootstrap_value=0.0)
-                    if trained:
-                        episode_losses[agent].append(loss)
-
-            for agent in agent_policies:
-                t_board_writer.add_scalar(f"reward/{agent}", episode_rewards[agent], episode)
-
-                avg_loss = sum(episode_losses[agent]) / len(episode_losses[agent]) if episode_losses[agent] else 0.0
-                t_board_writer.add_scalar(f"PPO Loss/{agent}", avg_loss, episode)
-                t_board_writer.add_scalar(f"Entropy Bonus/{agent}", agent_policies[agent].last_entropy_mean, episode)
-
-                for name, param in agent_policies[agent].actor.named_parameters():
-                    t_board_writer.add_histogram(f"weights/{agent}/actor/{name}", param.data.cpu(), episode)
-
-                for name, param in agent_policies[agent].critic.named_parameters():
-                    t_board_writer.add_histogram(f"weights/{agent}/critic/{name}", param.data.cpu(), episode)
-
-            t_board_writer.add_scalar("Total Reward", sum(episode_rewards.values()), episode)
-
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user. Saving progress...")
-
-    finally:
-        env.close()
-
-        _save_agent_checkpoints(agent_policies, "ppo")
-
-#***************************************************************************************************************#
-def run_random(num_episodes=100, env = None, render=True):
-
-    observations, _ = env.reset()
-    t_board_writer = SummaryWriter(log_dir="runs/RANDOM_" + datetime.now().strftime("%m_%d_%H%M"), comment="Random Policy")
-
-    print(f"Initialized random policies for agents:", list(observations.keys()))
-   
-    try:
-        for episode in tqdm(range(1, num_episodes + 1)):
-            observations_before, _ = env.reset()
-            episode_rewards = {agent: 0.0 for agent in observations}
-            
-            step = 0
-            while True:
-                current_agents = observations_before.keys()
-                if len(current_agents) == 0:
-                    break
-
-                actions = {}
-
-                for agent in current_agents:
-                    actions[agent] = random.choice(range(env.action_space(agent).n))
-                observations_after, rewards, terminations, truncations, infos = env.step(actions)
-                for agent in current_agents:
-                    reward = rewards.get(agent, 0.0)
-                    done = terminations.get(agent, False) or truncations.get(agent, False)
-                    episode_rewards[agent] += float(reward)
-                    
-                step += 1
-                if render and step % 10 == 0:
-                    env.render()
-                    time.sleep(0.02)
-
-                if all(terminations.get(a, False) or truncations.get(a, False) for a in observations_before):
-                    break
-            
-            t_board_writer.add_scalar("Total Reward", sum(episode_rewards.values()), episode)
-    
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user. Saving progress...")
-    
-    finally:
-        env.close()
-
-#***************************************************************************************************************#
-def run_A2C(num_episodes=100, env=None, render=True, load_saved_model=False):
-
-    learning_rate = 3e-4
-    gamma = 0.99
-    entropy_coef_start = 0.01
-    entropy_coef_decay = 0.999
-    entropy_coef_min = 0.001
-    rollout_length = 32
-
-    t_board_writer = SummaryWriter(
-        log_dir="runs/A2C_" + datetime.now().strftime("%m_%d_%H%M"),
-        comment="Advantage Actor-Critic"
-    )
-
-    # Reset environment
-    observations_before, _ = env.reset()
-
-    # Initialize policies
-    agent_policies = {}
-    for agent, obs in observations_before.items():
-        state_size = obs.size
-        action_size = env.action_space(agent).n
-
-        agent_policies[agent] = A2C_Logic(
-            state_size=state_size,
-            action_space=action_size,
-            learning_rate=learning_rate,
-            gamma=gamma,
-            entropy_coef=entropy_coef_start,
-            rollout_length=rollout_length,
-            hidden_layer_sizes=(128, 128),
-        )
-
-    print("Initialized A2C policies for agents:", list(agent_policies.keys()))
-
-    if load_saved_model:
-        _load_agent_checkpoints(agent_policies, "a2c")
-
-    try:
-        for episode in tqdm(range(1, num_episodes + 1)):
-
-            current_entropy_coef = max(
-                entropy_coef_min,
-                entropy_coef_start * (entropy_coef_decay ** (episode - 1))
+            loss_value = (
+                loss_vals["loss_objective"]
+                + loss_vals["loss_critic"]
+                + loss_vals["loss_entropy"]
             )
-            for policy in agent_policies.values():
-                policy.entropy_coef = current_entropy_coef
 
-            observations_before, _ = env.reset()
+            loss_value.backward()
+            iter_losses["total"].append(loss_value.detach().item())
+            iter_losses["objective"].append(loss_vals["loss_objective"].detach().item())
+            iter_losses["critic"].append(loss_vals["loss_critic"].detach().item())
+            iter_losses["entropy"].append(loss_vals["loss_entropy"].detach().item())
 
-            episode_rewards = {agent: 0.0 for agent in agent_policies}
-            episode_losses = {agent: [] for agent in agent_policies}
-            episode_entropies = {agent: [] for agent in agent_policies}
+            torch.nn.utils.clip_grad_norm_(loss_module.parameters(), max_grad_norm)
 
-            step = 0
+            optim.step()
+            optim.zero_grad()
 
-            while True:
+    collector.update_policy_weights_()
 
-                current_agents = list(observations_before.keys())
-                if len(current_agents) == 0:
-                    break
+    loss_iteration_history.append(iteration)
+    total_loss_history.append(sum(iter_losses["total"]) / len(iter_losses["total"]))
+    objective_loss_history.append(sum(iter_losses["objective"]) / len(iter_losses["objective"]))
+    critic_loss_history.append(sum(iter_losses["critic"]) / len(iter_losses["critic"]))
+    entropy_loss_history.append(sum(iter_losses["entropy"]) / len(iter_losses["entropy"]))
+    
+    episode_rewards = tensordict_data.get(("next", "agents", "episode_reward"))
+    done = tensordict_data.get(("next", "agents", "done"))
+    completed_rewards = episode_rewards[done]
+    if completed_rewards.numel() > 0:
+        episode_reward_mean_list.append(completed_rewards.mean().item())
+        episode_reward_iteration_list.append(iteration)
+    
+    running_return_history.append(episode_rewards[:, -1].mean().item())
+    step_reward_mean_history.append(
+        tensordict_data.get(("next", env.reward_key)).mean().item()
+    )
+    # ---- CHECKPOINTING ----
+    global_step += 1
 
-                # Select actions
-                actions = {}
-                for agent in current_agents:
-                    actions[agent] = agent_policies[agent].get_action(observations_before[agent])
+    # ---- TENSORBOARD ----
+    writer.add_scalar("loss/total", total_loss_history[-1], global_step)
+    writer.add_scalar("loss/objective", objective_loss_history[-1], global_step)
+    writer.add_scalar("loss/critic", critic_loss_history[-1], global_step)
+    writer.add_scalar("loss/entropy", entropy_loss_history[-1], global_step)
+    writer.add_scalar("reward/step_mean", step_reward_mean_history[-1], global_step)
+    writer.add_scalar("reward/running_return", running_return_history[-1], global_step)
+    if completed_rewards.numel() > 0:
+        writer.add_scalar("reward/episode_return", episode_reward_mean_list[-1], global_step)
+    writer.add_scalar("episodes/completed", int(done.any(dim=-1).sum().item()), global_step)
+    for name in ("pos_rew", "final_rew", "agent_collision_rew"):
+        writer.add_scalar(
+            f"reward_components/{name}",
+            tensordict_data.get(("next", "agents", "info", name)).mean().item(),
+            global_step,
+        )
+    writer.add_scalar("policy/action_scale_mean", tensordict_data.get(("agents", "scale")).mean().item(), global_step)
+    writer.add_scalar("progress/frames", global_step * frames_per_batch, global_step)
 
-                # Step environment
-                observations_after, rewards, terminations, truncations, _ = env.step(actions)
+    if global_step % histogram_interval == 0:
+        for name, param in mappo_policy.policy.named_parameters():
+            writer.add_histogram(f"weights/actor/{name}", param.data.cpu(), global_step)
+        for name, param in mappo_critic.policy.named_parameters():
+            writer.add_histogram(f"weights/critic/{name}", param.data.cpu(), global_step)
 
-                # Store transitions
-                for agent in current_agents:
-                    reward = rewards.get(agent, 0.0)
-                    done = terminations.get(agent, False) or truncations.get(agent, False)
-                    episode_rewards[agent] += float(reward)
+    if global_step % checkpoint_interval == 0:
+        checkpoint = {
+            "actor": mappo_policy.policy.state_dict(),
+            "critic": mappo_critic.policy.state_dict(),
+            "optimizer": optim.state_dict(),
+            "step": global_step,
+        }
 
-                    next_state = observations_after.get(agent, observations_before[agent])
-                    agent_policies[agent].remember(
-                        observations_before[agent],
-                        actions[agent],
-                        reward,
-                        next_state,
-                        done
-                    )
+        save_file = os.path.join(checkpoint_path, f"checkpoint_{global_step}.pt")
+        torch.save(checkpoint, save_file)
 
-                # Update once each agent buffer is truly full.
-                for agent in current_agents:
-                    if len(agent_policies[agent].memory) >= rollout_length:
-                        trained, loss, entropy = agent_policies[agent].learn()
-                        if trained:
-                            episode_losses[agent].append(loss)
-                            episode_entropies[agent].append(entropy)
+        print(f"\nCheckpoint saved at step {global_step}")
 
-                # Render
-                if render and step % 10 == 0:
-                    env.render()
-                    pygame.event.pump()
-
-                # Move forward
-                observations_before = observations_after
-                step += 1
-
-                # Episode termination condition
-                if all(terminations.get(a, False) or truncations.get(a, False)
-                       for a in current_agents):
-                    break
-
-            # Flush leftover rollout so short final segments also train.
-            for agent in agent_policies:
-                if len(agent_policies[agent].memory) > 0:
-                    trained, loss, entropy = agent_policies[agent].learn()
-                    if trained:
-                        episode_losses[agent].append(loss)
-                        episode_entropies[agent].append(entropy)
-
-            # Logging
-            for agent in agent_policies:
-                t_board_writer.add_scalar(f"reward/{agent}", episode_rewards[agent], episode)
-
-                for name, param in agent_policies[agent].policy.named_parameters():
-                    t_board_writer.add_histogram(f"{agent}/weights{name}", param.data.cpu(), episode)
-                    if param.grad is not None:
-                        t_board_writer.add_histogram(f"{agent}/gradients{name}", param.grad.data.cpu(), episode)
-
-                avg_loss = sum(episode_losses[agent]) / len(episode_losses[agent]) if episode_losses[agent] else 0.0
-                avg_entropy = sum(episode_entropies[agent]) / len(episode_entropies[agent]) if episode_entropies[agent] else 0.0
-
-                t_board_writer.add_scalar(f"loss/{agent}", avg_loss, episode)
-                t_board_writer.add_scalar(f"entropy/{agent}", avg_entropy, episode)
-
-            t_board_writer.add_scalar("Total Reward", sum(episode_rewards.values()), episode)
-            t_board_writer.add_scalar("entropy_coef", current_entropy_coef, episode)
-
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user. Saving progress...")
-
-    finally:
-        env.close()
-        _save_agent_checkpoints(agent_policies, "a2c")
+    pbar.update()
 
 
-#*********************************************************************************#
-if __name__ == "__main__":
-    selected_algorithm = _prompt_algorithm(default="dqn")
-    load_saved_model = _prompt_yes_no("Load saved model on start?", default=False)
-    num_episodes = _prompt_int("Enter number of episodes", default=10000)
-    headless = _prompt_yes_no("Run headless?", default=True)
-    verbose = _prompt_yes_no("Enable verbose logging?", default=False)
+# Render one rollout from a freshly reset (random) environment and log it to TensorBoard
+def rendering_callback(env, td):
+    env.frames.append(Image.fromarray(env.render(mode="rgb_array")))
 
-    if selected_algorithm == "dqn":
-        initial_epsilon = _prompt_float("Set initial epsilon for DQN", default=1.0, min_value=0.0, max_value=1.0)
-
-    tb_process = launch_tensorboard("runs")
-
-    env = knights_archers_zombies_v10.parallel_env(
-        render_mode="human" if not headless else None,
-        spawn_rate=1,
-        num_archers=2,
-        num_knights=2,
-        max_zombies=1,
-        max_arrows=2,
-        max_cycles=2000
+env.frames = []
+with torch.no_grad():
+    env.rollout(
+        max_steps=100,
+        policy=mappo_policy.policy,
+        callback=rendering_callback,
+        auto_cast_to_device=True,
+        break_when_any_done=False,
     )
 
-    if selected_algorithm == "dqn":
-        run_DQN(
-            num_episodes=num_episodes,
-            verbose=verbose,
-            env=env,
-            epsilon=initial_epsilon,
-            epsilon_decay=0.9997,
-            epsilon_min=0.1,
-            render=not headless,
-            load_saved_model=load_saved_model,
+env.frames[0].save(
+    os.path.join(writer.log_dir, "final_rollout.gif"),
+    save_all=True,
+    append_images=env.frames[1:],
+    duration=50,
+    loop=0,
+)
+# Playable animation (appears as a GIF in the Images tab). torch's add_video fails on Windows,
+# so build the same GIF image summary that it would produce.
+gif_path = os.path.join(writer.log_dir, "final_rollout.gif")
+with open(gif_path, "rb") as gif_file:
+    gif_bytes = gif_file.read()
+width, height = env.frames[0].size
+gif_summary = Summary(
+    value=[
+        Summary.Value(
+            tag="render/final_rollout",
+            image=Summary.Image(height=height, width=width, colorspace=3, encoded_image_string=gif_bytes),
         )
+    ]
+)
+writer._get_file_writer().add_summary(gif_summary, global_step)
 
-    if selected_algorithm == "pg":    
-        run_REINFORCE(
-            num_episodes=num_episodes,
-            env=env,
-            verbose=verbose,
-            render=not headless,
-            load_saved_model=load_saved_model,
-        )
-    
-    if selected_algorithm == "a2c":    
-        run_A2C(
-            num_episodes=num_episodes,
-            env=env,
-            render=not headless,
-            load_saved_model=load_saved_model,
-        )
-    if selected_algorithm == "ppo":
-        run_PPO(
-            num_episodes=num_episodes,
-            env=env,
-            verbose=verbose,
-            render=not headless,
-            load_saved_model=load_saved_model,
-        )
-    if selected_algorithm == "random":    
-        run_random(
-            num_episodes=num_episodes,
-            env=env,
-            render=not headless,
-        )
+writer.flush()
+
+
+
+## Policy Network and Actor Setup-------------------------------------------------------------------------------------------------
+
+
+
+# import os
+# import time
+# from datetime import datetime
+# import matplotlib.pyplot as plt
+# import numpy as np
+# import torch
+# import pygame
+# from pettingzoo.butterfly import knights_archers_zombies_v10
+# from DQN import DQN_Logic
+# from REINFORCE import ReinforcePolicy
+# from A2C import A2C_Logic
+# from PPO import PPOPolicy
+# from torch.utils.tensorboard import SummaryWriter
+# from tqdm import tqdm
+# import subprocess
+# import os
+# import webbrowser
+# import random
+# import logging
+# from pathlib import Path
+
+# logger = logging.getLogger(__name__)
+
+# #***************************************************************************************************************#
+# def launch_tensorboard(logdir="runs"):
+#     # Ensure the log directory exists
+
+#     os.makedirs(logdir, exist_ok=True)
+
+#     # Launch TensorBoard as a background process
+#     tb = subprocess.Popen(
+#         ["tensorboard", f"--logdir={logdir}", "--bind_all", "--port=6006"],
+#         stdout=subprocess.PIPE,
+#         stderr=subprocess.PIPE
+#     )
+
+#     # Optional: auto-open browser
+#     webbrowser.open("http://localhost:6006")
+
+#     return tb
+
+
+# #***************************************************************************************************************#
+# def run_PPO(num_episodes=100, verbose=True, env=None, render=True, load_saved_model=False):
+
+#   
+
+
+#             t_board_writer.add_scalar("Total Reward", sum(episode_rewards.values()), episode)
+
+#     except KeyboardInterrupt:
+#         print("\nTraining interrupted by user. Saving progress...")
+
+#     finally:
+#         env.close()
+
+#         _save_agent_checkpoints(agent_policies, "ppo")
+

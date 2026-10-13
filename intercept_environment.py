@@ -28,6 +28,9 @@ class TrainingScenario(BaseScenario):
         # Units: 1 world unit = 1 km, 1 time unit = 1 s. The default world is 80 km x 80 km (~50 mi).
         self.world_spawning_x = kwargs.pop("world_spawning_x", 40.0)
         self.world_spawning_y = kwargs.pop("world_spawning_y", 40.0)
+        # The VMAS camera spans viewer_zoom**2 on each side (and zooms out to fit agents when
+        # that is larger), so this fixes the view at +/-1.25x the spawn area.
+        self.viewer_zoom = (1.25 * max(self.world_spawning_x, self.world_spawning_y)) ** 0.5
 
         self.comms_rendering_range = kwargs.pop("comms_rendering_range", 0.0)
 

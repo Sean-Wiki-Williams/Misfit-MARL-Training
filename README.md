@@ -73,6 +73,16 @@ The script falls back to the CPU if CUDA is unavailable, but 600 parallel enviro
 python main.py
 ```
 
+An interactive menu offers **Train from scratch** or **Load a prior checkpoint** (pick from a list of saved checkpoints or enter a path). To skip the menu:
+
+```powershell
+python main.py --scratch            # new run
+python main.py --resume latest      # continue from the newest checkpoint
+python main.py --resume checkpoints\checkpoint_200.pt
+```
+
+Resumed runs continue the step count and run `n_iters` more iterations. Checkpoints saved with a different observation size or network shape can't be loaded; the program reports this and exits.
+
 ## Checkpoints
 
 Every 100 iterations (`checkpoint_interval`), `main.py` saves `checkpoints/checkpoint_<step>.pt` containing the actor and critic weights, optimizer state and step number.

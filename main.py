@@ -1,4 +1,9 @@
-from environment import TrainingScenario
+# Show the start menu before the slow imports so the CLI responds instantly
+import cli
+
+run_config = cli.get_run_config() if __name__ == "__main__" else cli.RunConfig()
+
+from intercept_environment import TrainingScenario
 from torchrl.envs.libs.vmas import VmasEnv
 from torchrl.envs.utils import MarlGroupMapType
 import torch
@@ -17,10 +22,10 @@ from torchrl.collectors import Collector
 import utils
 from tensordict.nn import TensorDictModule
 
-#frames_per_batch = 60_000  # 600 envs x 100 steps = one full episode per env per iteration
-#n_iters = 300  # Number of sampling and training iterations
-frames_per_batch = 6_000  # 600 envs x 100 steps = one full episode per env per iteration
-n_iters = 100  # Number of sampling and training iterations
+frames_per_batch = 60_000  # 600 envs x 100 steps = one full episode per env per iteration
+n_iters = 300  # Number of sampling and training iterations
+#frames_per_batch = 6_000  # 600 envs x 100 steps = one full episode per env per iteration
+#n_iters = 100  # Number of sampling and training iterations
 total_frames = frames_per_batch * n_iters
 
 # Training
@@ -108,6 +113,20 @@ checkpoint_path = "checkpoints"
 os.makedirs(checkpoint_path, exist_ok=True)
 
 global_step = 0
+if run_config.resume:
+    try:
+        saved = torch.load(run_config.checkpoint_path, map_location=env.device)
+        mappo_policy.policy.load_state_dict(saved["actor"])
+        mappo_critic.policy.load_state_dict(saved["critic"])
+        optim.load_state_dict(saved["optimizer"])
+    except (RuntimeError, KeyError) as error:
+        raise SystemExit(
+            f"\nCould not load '{run_config.checkpoint_path}'. It was probably saved with a different "
+            f"environment or network shape (for example before the observation changed).\n"
+            f"Details: {str(error).splitlines()[0]}"
+        )
+    global_step = saved["step"]
+cli.print_run_summary(run_config, global_step)
 pbar = tqdm(total=n_iters)
 
 episode_reward_mean_list = []
